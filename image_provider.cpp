@@ -40,8 +40,11 @@
 #include "esp_heap_caps.h"
 #endif
 
-#if __has_include("ESP32_P4_IMX219.h")
+#if defined(ARDUINO_ARCH_ESP32P4)
 #include <ESP32_P4_IMX219.h>
+#define TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB 1
+#elif __has_include("ESP32_P4_IMX219.h")
+#include "ESP32_P4_IMX219.h"
 #define TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB 1
 #elif __has_include(<ESP32_P4_IMX219.h>)
 #include <ESP32_P4_IMX219.h>

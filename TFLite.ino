@@ -42,12 +42,15 @@ static HardwareSerial UartToS3(1);
 
 static constexpr int kDebugBaud = 921600;
 static constexpr int kUartBaud = 921600;
-static constexpr int kUartRxPin = 11;
-static constexpr int kUartTxPin = 10;
+static constexpr int kUartRxPin = 38;
+static constexpr int kUartTxPin = 37;
 
 static constexpr uint8_t kSync0 = 0xAA;
 static constexpr uint8_t kSync1 = 0x55;
 static constexpr uint8_t kMsgTypeInference = 0x01;
+
+static constexpr uint32_t kUartTxTaskStackBytes = 4 * 1024;
+static constexpr uint32_t kInferenceTaskStackBytes = 32 * 1024;
 
 struct UartPacket {
   uint16_t frame_id;
@@ -219,11 +222,11 @@ void setup() {
   input = interpreter->input(0);
 
 #if defined(portNUM_PROCESSORS) && (portNUM_PROCESSORS > 1)
-  xTaskCreatePinnedToCore(uart_tx_task, "uart_tx", 2048, nullptr, 2, nullptr, 0);
-  xTaskCreatePinnedToCore(inference_task, "tflm", 8192, nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(uart_tx_task, "uart_tx", kUartTxTaskStackBytes, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, nullptr, 1);
 #else
-  xTaskCreate(uart_tx_task, "uart_tx", 2048, nullptr, 2, nullptr);
-  xTaskCreate(inference_task, "tflm", 8192, nullptr, 3, nullptr);
+  xTaskCreate(uart_tx_task, "uart_tx", kUartTxTaskStackBytes, nullptr, 2, nullptr);
+  xTaskCreate(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, nullptr);
 #endif
 }
 
