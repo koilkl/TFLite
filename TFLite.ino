@@ -33,10 +33,10 @@ limitations under the License.
 #include <SD_MMC.h>
 #include <FFat.h>
 #include <driver/gpio.h>
+#include <errno.h>
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/stat.h>
 
 // Globals, used for compatibility with Arduino-style sketches.
 namespace {
@@ -117,6 +117,7 @@ static char s_run_dir[32] = {0};
 static bool s_sd_using_sd_mmc = false;
 static bool s_sd_using_ffat = false;
 static const char *s_sd_mount_point = kMountPoint;
+static bool s_sd_full = false;
 
 // In order to use optimized tensorflow lite kernels, a signed int8_t quantized
 // model is preferred over the legacy unsigned model format. This means that
@@ -255,10 +256,19 @@ static void sd_task(void *arg) {
       continue;
     }
 
+    if (s_sd_full) {
+      continue;
+    }
+
     char path[96];
     snprintf(path, sizeof(path), "%s/frame_%05u.pgm", s_run_dir, (unsigned)pkt.frame_id);
     bool ok = write_pgm(path, s_sd_buffers[pkt.buffer_index]);
     saved++;
+
+    if (!ok && errno == ENOSPC) {
+      s_sd_full = true;
+      Serial.printf("Storage full (ENOSPC). Stop saving frames. Last=%s\n", path);
+    }
 
     if ((saved % 10) == 0) {
       Serial.printf("SD saved=%lu last=%s %s\n", (unsigned long)saved, path, ok ? "OK" : "FAIL");
@@ -336,7 +346,7 @@ static void inference_task(void *arg) {
     uint8_t confidence = 0;
     pick_label_and_confidence(output, &label_id, &confidence);
 
-    if (kEnableSdLogger && s_sd_queue && (frame_id % kSaveEveryNFrames) == 0) {
+    if (kEnableSdLogger && s_sd_queue && !s_sd_full && (frame_id % kSaveEveryNFrames) == 0) {
       uint8_t *dst = s_sd_buffers[next_sd_buffer];
       for (size_t i = 0; i < kImageBytes; i++) {
         dst[i] = (uint8_t)((int)input->data.int8[i] + 128);

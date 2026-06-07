@@ -32,6 +32,23 @@ All parameters below are defined at the top of [TFLite.ino](file:///Users/koil/G
   - If `true`, FFat will be formatted automatically on first run when no filesystem is detected
   - Formatting only affects the `ffat` partition in the flash
 
+### FFat Capacity
+
+FFat uses the on-board flash partition named `ffat`. With the default partition scheme in this repo (`app3M_fat9M_16MB`), it is roughly **9MB** usable.
+
+- One 96×96 grayscale frame stored as raw bytes is `96 * 96 = 9216 bytes`
+- Approx maximum number of frames:
+  - `~ 9 * 1024 * 1024 / 9216 ≈ 1000 frames`
+
+PGM has a small header and the filesystem has overhead (FAT tables, directories), so treat this as an approximate upper bound.
+
+### When storage is full
+
+If FFat runs out of space (`ENOSPC`), the sketch will:
+
+- Print `Storage full (ENOSPC). Stop saving frames...`
+- Stop saving new frames (inference and UART output keep running)
+
 ### SD_MMC Pins (Optional)
 If your board requires custom SD_MMC pins, enable and set these:
 - `kUseSdMmcCustomPins`: set to `true`
