@@ -20,8 +20,16 @@
 #include "esp_log.h"
 #endif
 
+#if __has_include("esp_err.h")
+#include "esp_err.h"
+#endif
+
 #if __has_include("nvs_flash.h")
 #include "nvs_flash.h"
+#endif
+
+#if __has_include("esp_timer.h")
+#include "esp_timer.h"
 #endif
 
 #if __has_include("driver/ledc.h")
@@ -34,6 +42,13 @@
 
 #if __has_include("imx219.h")
 #include "imx219.h"
+#endif
+
+#if __has_include("esp_cam_sensor_xclk.h")
+#include "esp_cam_sensor_xclk.h"
+#define TFLITE_P4_IMX219_HAS_XCLK_ROUTER 1
+#else
+#define TFLITE_P4_IMX219_HAS_XCLK_ROUTER 0
 #endif
 
 #if __has_include("esp_heap_caps.h")
@@ -77,6 +92,15 @@
 
 static int *s_x_lut = NULL;
 static int *s_y_lut = NULL;
+static const char *kTag = "tflite_cam";
+
+#if __has_include("esp_log.h")
+#define TFLITE_CAM_LOGI(...) ESP_LOGI(kTag, __VA_ARGS__)
+#define TFLITE_CAM_LOGW(...) ESP_LOGW(kTag, __VA_ARGS__)
+#else
+#define TFLITE_CAM_LOGI(...) do { printf(__VA_ARGS__); printf("\n"); } while (0)
+#define TFLITE_CAM_LOGW(...) do { printf(__VA_ARGS__); printf("\n"); } while (0)
+#endif
 
 #if TFLITE_P4_IMX219_HAS_ESP_VIDEO
 static int s_fd = -1;
@@ -84,23 +108,206 @@ static void *s_mapped_bufs[2] = {0};
 static size_t s_mapped_lens[2] = {0};
 static uint8_t *s_rgb_buf = NULL;
 static bool s_camera_inited = false;
+static volatile bool s_in_dqbuf = false;
+static volatile uint64_t s_dqbuf_enter_us = 0;
+static uint64_t s_capture_start_us = 0;
+static uint64_t s_last_stats_us = 0;
+static uint32_t s_total_frames = 0;
+static uint32_t s_last_stat_frames = 0;
+static bool s_summary_logged = false;
+static esp_cam_sensor_format_t s_sensor_fmt_patch = {};
+#if TFLITE_P4_IMX219_HAS_XCLK_ROUTER
+static esp_cam_sensor_xclk_handle_t s_xclk_handle = NULL;
+#endif
 
 static void camera_deinit(void);
 
-static const gpio_num_t kI2cMasterScl = GPIO_NUM_8;
-static const gpio_num_t kI2cMasterSda = GPIO_NUM_7;
+static const gpio_num_t kI2cMasterScl = GPIO_NUM_26;
+static const gpio_num_t kI2cMasterSda = GPIO_NUM_27;
 static const int kI2cMasterNum = 0;
 static const int kI2cMasterFreqHz = 100000;
 static const gpio_num_t kXclkPin = GPIO_NUM_20;
-static const int kXclkFreqHz = 24000000;
+static constexpr uint32_t kXclkScanHz[] = {24000000, 19200000, 12000000, 6000000};
+static constexpr size_t kXclkScanIndex = 0;
+static_assert(kXclkScanIndex < (sizeof(kXclkScanHz) / sizeof(kXclkScanHz[0])), "kXclkScanIndex out of range");
+static constexpr bool kForceSensorFmt = false;
+static constexpr int32_t kHsSettleOverride = -1;
+static constexpr int32_t kLineSyncOverride = -1;
+static constexpr uint32_t kExperimentObserveSeconds = 10;
+
+static uint32_t active_xclk_hz() {
+  return kXclkScanHz[kXclkScanIndex];
+}
+
+static bool sensor_patch_requested() {
+  return kHsSettleOverride >= 0 || kLineSyncOverride >= 0;
+}
+
+static void log_scan_configuration() {
+  TFLITE_CAM_LOGI("scan config: xclk_idx=%u xclk_hz=%lu hs_settle_override=%ld line_sync_override=%ld force_sensor_fmt=%d observe_s=%lu",
+                  (unsigned)kXclkScanIndex, (unsigned long)active_xclk_hz(), (long)kHsSettleOverride,
+                  (long)kLineSyncOverride, (int)kForceSensorFmt, (unsigned long)kExperimentObserveSeconds);
+  TFLITE_CAM_LOGI("xclk candidates: [0]=24000000 [1]=19200000 [2]=12000000 [3]=6000000");
+}
+
+static void log_sensor_fmt(const char *stage, const esp_cam_sensor_format_t *fmt) {
+  TFLITE_CAM_LOGI("sensor fmt(%s): w=%u h=%u out_fmt=%u port=%u xclk=%d mipi_clk=%lu lanes=%lu hs_settle=%lu line_sync=%d",
+                  stage, (unsigned)fmt->width, (unsigned)fmt->height, (unsigned)fmt->format, (unsigned)fmt->port,
+                  (int)fmt->xclk, (unsigned long)fmt->mipi_info.mipi_clk, (unsigned long)fmt->mipi_info.lane_num,
+                  (unsigned long)fmt->mipi_info.hs_settle, (int)fmt->mipi_info.line_sync_en);
+}
+
+static void warn_if_sensor_mode_changed(const esp_cam_sensor_format_t *before, const esp_cam_sensor_format_t *after) {
+  if (after->width == 1920 && after->height == 1080) {
+    TFLITE_CAM_LOGW("sensor fmt jumped to 1080p; stop this scan point and avoid mixing it with 1536x1232 RAW10 capture");
+  }
+  if (before->width != after->width || before->height != after->height || before->format != after->format) {
+    TFLITE_CAM_LOGW("sensor mode changed: before=%ux%u fmt=%u after=%ux%u fmt=%u",
+                    (unsigned)before->width, (unsigned)before->height, (unsigned)before->format,
+                    (unsigned)after->width, (unsigned)after->height, (unsigned)after->format);
+  }
+}
+
+static void log_v4l2_capture_fmt(const char *stage, const struct v4l2_format *fmt) {
+  TFLITE_CAM_LOGI("capture fmt(%s): w=%u h=%u fourcc=%c%c%c%c field=%u bytesperline=%u sizeimage=%u",
+                  stage, (unsigned)fmt->fmt.pix.width, (unsigned)fmt->fmt.pix.height,
+                  fmt->fmt.pix.pixelformat & 0xff, (fmt->fmt.pix.pixelformat >> 8) & 0xff,
+                  (fmt->fmt.pix.pixelformat >> 16) & 0xff, (fmt->fmt.pix.pixelformat >> 24) & 0xff,
+                  (unsigned)fmt->fmt.pix.field, (unsigned)fmt->fmt.pix.bytesperline, (unsigned)fmt->fmt.pix.sizeimage);
+}
+
+static void maybe_log_capture_stats(void) {
+#if __has_include("esp_timer.h")
+  uint64_t now = esp_timer_get_time();
+  if (s_capture_start_us == 0) {
+    s_capture_start_us = now;
+    s_last_stats_us = now;
+    return;
+  }
+
+  if (now - s_last_stats_us >= 1000000ULL) {
+    uint64_t dq_ms = 0;
+    if (s_in_dqbuf && s_dqbuf_enter_us != 0) {
+      dq_ms = (now - s_dqbuf_enter_us) / 1000ULL;
+    }
+    uint32_t delta_frames = s_total_frames - s_last_stat_frames;
+    s_last_stat_frames = s_total_frames;
+    s_last_stats_us = now;
+    TFLITE_CAM_LOGI("Capture FPS: %lu (in_dqbuf=%d dq_ms=%llu total_frame=%lu)",
+                    (unsigned long)delta_frames, (int)s_in_dqbuf,
+                    (unsigned long long)dq_ms, (unsigned long)s_total_frames);
+  }
+
+  if (!s_summary_logged &&
+      (now - s_capture_start_us) >= (uint64_t)kExperimentObserveSeconds * 1000000ULL) {
+    uint64_t dq_ms = 0;
+    if (s_in_dqbuf && s_dqbuf_enter_us != 0) {
+      dq_ms = (now - s_dqbuf_enter_us) / 1000ULL;
+    }
+    s_summary_logged = true;
+    TFLITE_CAM_LOGI("SCAN SUMMARY: xclk_idx=%u xclk_hz=%lu hs_settle_override=%ld line_sync_override=%ld observe_s=%lu total_frame=%lu dq_ms=%llu result=%s",
+                    (unsigned)kXclkScanIndex, (unsigned long)active_xclk_hz(), (long)kHsSettleOverride,
+                    (long)kLineSyncOverride, (unsigned long)kExperimentObserveSeconds,
+                    (unsigned long)s_total_frames, (unsigned long long)dq_ms,
+                    s_total_frames > 0 ? "FRAME_OK" : "NO_FRAME");
+  }
+#endif
+}
+
+static void inspect_and_patch_sensor_fmt_if_needed(void) {
+  if (s_fd < 0) {
+    return;
+  }
+
+  esp_cam_sensor_format_t before;
+  memset(&before, 0, sizeof(before));
+  if (ioctl(s_fd, VIDIOC_G_SENSOR_FMT, &before) != 0) {
+    TFLITE_CAM_LOGW("VIDIOC_G_SENSOR_FMT failed: errno=%d (%s)", errno, strerror(errno));
+    return;
+  }
+  log_sensor_fmt("before", &before);
+
+  if (!kForceSensorFmt && !sensor_patch_requested()) {
+    return;
+  }
+
+  memcpy(&s_sensor_fmt_patch, &before, sizeof(s_sensor_fmt_patch));
+  if (kForceSensorFmt) {
+    s_sensor_fmt_patch.name = "forced";
+    s_sensor_fmt_patch.width = IMG_WIDTH;
+    s_sensor_fmt_patch.height = IMG_HEIGHT;
+    s_sensor_fmt_patch.format = ESP_CAM_SENSOR_PIXFORMAT_RAW10;
+    s_sensor_fmt_patch.port = ESP_CAM_SENSOR_MIPI_CSI;
+    s_sensor_fmt_patch.xclk = active_xclk_hz();
+    if (s_sensor_fmt_patch.mipi_info.mipi_clk == 0) {
+      s_sensor_fmt_patch.mipi_info.mipi_clk = 456000000;
+    }
+    if (s_sensor_fmt_patch.mipi_info.lane_num == 0) {
+      s_sensor_fmt_patch.mipi_info.lane_num = 2;
+    }
+  } else {
+    s_sensor_fmt_patch.name = "patched";
+  }
+
+  if (kHsSettleOverride >= 0) {
+    s_sensor_fmt_patch.mipi_info.hs_settle = (uint32_t)kHsSettleOverride;
+  }
+  if (kLineSyncOverride >= 0) {
+    s_sensor_fmt_patch.mipi_info.line_sync_en = kLineSyncOverride ? 1 : 0;
+  }
+
+  TFLITE_CAM_LOGI("request sensor fmt(%s): xclk=%d mipi_clk=%lu lanes=%lu hs_settle=%lu line_sync=%d",
+                  kForceSensorFmt ? "force" : "patch",
+                  (int)s_sensor_fmt_patch.xclk, (unsigned long)s_sensor_fmt_patch.mipi_info.mipi_clk,
+                  (unsigned long)s_sensor_fmt_patch.mipi_info.lane_num, (unsigned long)s_sensor_fmt_patch.mipi_info.hs_settle,
+                  (int)s_sensor_fmt_patch.mipi_info.line_sync_en);
+  if (ioctl(s_fd, VIDIOC_S_SENSOR_FMT, &s_sensor_fmt_patch) != 0) {
+    TFLITE_CAM_LOGW("VIDIOC_S_SENSOR_FMT failed: errno=%d (%s)", errno, strerror(errno));
+  }
+
+  esp_cam_sensor_format_t after;
+  memset(&after, 0, sizeof(after));
+  if (ioctl(s_fd, VIDIOC_G_SENSOR_FMT, &after) == 0) {
+    log_sensor_fmt("after", &after);
+    warn_if_sensor_mode_changed(&before, &after);
+  }
+}
 
 static void enable_xclk(void) {
+#if TFLITE_P4_IMX219_HAS_XCLK_ROUTER
+  if (s_xclk_handle != NULL) {
+    esp_cam_sensor_xclk_stop(s_xclk_handle);
+    esp_cam_sensor_xclk_free(s_xclk_handle);
+    s_xclk_handle = NULL;
+  }
+
+  esp_err_t err = esp_cam_sensor_xclk_allocate(ESP_CAM_SENSOR_XCLK_ESP_CLOCK_ROUTER, &s_xclk_handle);
+#if __has_include("esp_err.h")
+  TFLITE_CAM_LOGI("xclk_allocate: %s", esp_err_to_name(err));
+#else
+  TFLITE_CAM_LOGI("xclk_allocate: %d", (int)err);
+#endif
+  if (err != ESP_OK) {
+    return;
+  }
+
+  esp_cam_sensor_xclk_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.esp_clock_router_cfg.xclk_pin = kXclkPin;
+  cfg.esp_clock_router_cfg.xclk_freq_hz = active_xclk_hz();
+  err = esp_cam_sensor_xclk_start(s_xclk_handle, &cfg);
+#if __has_include("esp_err.h")
+  TFLITE_CAM_LOGI("xclk_start: %s gpio=%d freq=%lu", esp_err_to_name(err), (int)kXclkPin, (unsigned long)active_xclk_hz());
+#else
+  TFLITE_CAM_LOGI("xclk_start: %d gpio=%d freq=%lu", (int)err, (int)kXclkPin, (unsigned long)active_xclk_hz());
+#endif
+#else
   ledc_timer_config_t ledc_timer;
   memset(&ledc_timer, 0, sizeof(ledc_timer));
   ledc_timer.timer_num = LEDC_TIMER_0;
   ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
   ledc_timer.duty_resolution = LEDC_TIMER_1_BIT;
-  ledc_timer.freq_hz = kXclkFreqHz;
+  ledc_timer.freq_hz = active_xclk_hz();
   ledc_timer.clk_cfg = LEDC_AUTO_CLK;
   ledc_timer_config(&ledc_timer);
 
@@ -113,6 +320,8 @@ static void enable_xclk(void) {
   ledc_channel.hpoint = 0;
   ledc_channel.timer_sel = LEDC_TIMER_0;
   ledc_channel_config(&ledc_channel);
+  TFLITE_CAM_LOGI("xclk_start: ledc gpio=%d freq=%lu", (int)kXclkPin, (unsigned long)active_xclk_hz());
+#endif
 }
 
 static void *tflite_cam_malloc(size_t size) {
@@ -255,6 +464,7 @@ static TfLiteStatus camera_init_if_needed(tflite::ErrorReporter* error_reporter)
   nvs_flash_init();
 #endif
 
+  log_scan_configuration();
   enable_xclk();
   usleep(100 * 1000);
 
@@ -287,17 +497,21 @@ static TfLiteStatus camera_init_if_needed(tflite::ErrorReporter* error_reporter)
     return kTfLiteError;
   }
 
+  inspect_and_patch_sensor_fmt_if_needed();
+
   struct v4l2_format fmt;
   memset(&fmt, 0, sizeof(fmt));
   fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   fmt.fmt.pix.width = IMG_WIDTH;
   fmt.fmt.pix.height = IMG_HEIGHT;
   fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_SBGGR10;
+  log_v4l2_capture_fmt("request", &fmt);
   if (ioctl(s_fd, VIDIOC_S_FMT, &fmt) != 0) {
     TF_LITE_REPORT_ERROR(error_reporter, "VIDIOC_S_FMT failed: %d (%s)", errno, strerror(errno));
     camera_deinit();
     return kTfLiteError;
   }
+  log_v4l2_capture_fmt("applied", &fmt);
 
   struct v4l2_requestbuffers req;
   memset(&req, 0, sizeof(req));
@@ -359,6 +573,13 @@ static TfLiteStatus camera_init_if_needed(tflite::ErrorReporter* error_reporter)
   }
 
   s_camera_inited = true;
+  s_total_frames = 0;
+  s_last_stat_frames = 0;
+  s_in_dqbuf = false;
+  s_dqbuf_enter_us = 0;
+  s_capture_start_us = 0;
+  s_last_stats_us = 0;
+  s_summary_logged = false;
   return kTfLiteOk;
 }
 
@@ -386,6 +607,14 @@ static void camera_deinit(void) {
     s_rgb_buf = NULL;
   }
 
+#if TFLITE_P4_IMX219_HAS_XCLK_ROUTER
+  if (s_xclk_handle != NULL) {
+    esp_cam_sensor_xclk_stop(s_xclk_handle);
+    esp_cam_sensor_xclk_free(s_xclk_handle);
+    s_xclk_handle = NULL;
+  }
+#endif
+
   s_camera_inited = false;
 }
 
@@ -399,6 +628,11 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   }
 
 #if TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB
+  static bool s_backend_logged = false;
+  if (!s_backend_logged) {
+    s_backend_logged = true;
+    TFLITE_CAM_LOGI("GetImage backend: arduino_imx219_lib");
+  }
   static bool s_ok = false;
   if (!s_ok) {
     s_ok = esp32_p4_imx219_begin();
@@ -434,6 +668,11 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
 
   return kTfLiteOk;
 #elif TFLITE_P4_IMX219_HAS_ESP_VIDEO
+  static bool s_backend_logged = false;
+  if (!s_backend_logged) {
+    s_backend_logged = true;
+    TFLITE_CAM_LOGI("GetImage backend: esp_video");
+  }
   if (camera_init_if_needed(error_reporter) != kTfLiteOk) {
     return kTfLiteError;
   }
@@ -442,10 +681,20 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   memset(&buf_dq, 0, sizeof(buf_dq));
   buf_dq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   buf_dq.memory = V4L2_MEMORY_MMAP;
+  s_in_dqbuf = true;
+  s_dqbuf_enter_us = 0;
+#if __has_include("esp_timer.h")
+  s_dqbuf_enter_us = esp_timer_get_time();
+#endif
   if (ioctl(s_fd, VIDIOC_DQBUF, &buf_dq) != 0) {
+    s_in_dqbuf = false;
+    s_dqbuf_enter_us = 0;
+    maybe_log_capture_stats();
     TF_LITE_REPORT_ERROR(error_reporter, "VIDIOC_DQBUF failed: %d (%s)", errno, strerror(errno));
     return kTfLiteError;
   }
+  s_in_dqbuf = false;
+  s_dqbuf_enter_us = 0;
   if (buf_dq.index >= 2 || s_mapped_bufs[buf_dq.index] == NULL) {
     TF_LITE_REPORT_ERROR(error_reporter, "invalid dqbuf index: %d", (int)buf_dq.index);
     ioctl(s_fd, VIDIOC_QBUF, &buf_dq);
@@ -465,6 +714,9 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     TF_LITE_REPORT_ERROR(error_reporter, "VIDIOC_QBUF failed: %d (%s)", errno, strerror(errno));
     return kTfLiteError;
   }
+
+  s_total_frames++;
+  maybe_log_capture_stats();
 
   return kTfLiteOk;
 #else
