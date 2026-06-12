@@ -9,9 +9,28 @@ All parameters below are defined at the top of [TFLite.ino](file:///Users/koil/G
 ### UART (P4 -> S3)
 
 - `kUartBaud`: UART baud rate (default: 921600)
-- `kUartRxPin` / `kUartTxPin`: P4 UART pins (default: RX=38, TX=37)
+- `kUartRxPin` / `kUartTxPin`: P4 UART pins (new board default: RX=10, TX=11)
 - Packet format (8 bytes):
   - `0xAA 0x55` + `msg_type(0x01)` + `frame_id(uint16 LE)` + `label_id(uint8)` + `confidence(uint8)` + `flags(uint8)`
+
+### P4 <-> S3 Connection Check (Analog Handshake)
+
+This project uses a simple “is P4 connected” check before S3 starts parsing labels:
+
+- P4 outputs a fixed PWM value on `kHandshakePwmPin` using `analogWrite`
+- S3 sets an ADC pin to input and loops `analogRead()` until it reaches the threshold
+
+Wiring:
+
+- P4 `GPIO9` -> S3 `GPIO8` (ADC)
+- GND -> GND
+
+The corresponding S3 receiver sketch and parameters are documented in [S3_UART_Receiver/README.md](file:///Users/koil/Google-Teachable-Machine-TFLite-model-training/S3_UART_Receiver/README.md).
+
+Recommended settings (current defaults):
+
+- P4: `kHandshakePwmDuty = 255`
+- S3: detect when `analogRead(GPIO8) >= 2000`
 
 ### Serial Monitor (P4)
 
@@ -35,6 +54,10 @@ All parameters below are defined at the top of [TFLite.ino](file:///Users/koil/G
 - `kFormatFfatOnFail`:
   - If `true`, FFat will be formatted automatically on first run when no filesystem is detected
   - Formatting only affects the `ffat` partition in the flash
+
+Important note (new ESP32-P4 board):
+
+- The current new board cannot use FFat. Use `StorageBackend::SdMmc` and keep FFat-related tools disabled.
 
 ### FFat Capacity
 
@@ -71,4 +94,3 @@ If you use the on-board MicroSD slot, keep `kUseSdMmcCustomPins=false` and the s
 
 - If using SD\_MMC (`/sdcard`): remove the SD card and read it on your computer.
 - If using FFat (`/ffat`): files are in on-board flash. Export via USB MSC (if enabled for this board) or by writing a small serial-dump tool.
-

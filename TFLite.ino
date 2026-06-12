@@ -49,8 +49,11 @@ static HardwareSerial UartToS3(1);
 
 static constexpr int kDebugBaud = 921600;
 static constexpr int kUartBaud = 921600;
-static constexpr int kUartRxPin = 38;
-static constexpr int kUartTxPin = 37;
+static constexpr int kUartRxPin = 10;
+static constexpr int kUartTxPin = 11;
+
+static constexpr int kHandshakePwmPin = 9;
+static constexpr int kHandshakePwmDuty = 255;
 
 static constexpr uint8_t kSync0 = 0xAA;
 static constexpr uint8_t kSync1 = 0x55;
@@ -401,6 +404,9 @@ void setup() {
   Serial.begin(kDebugBaud);
   delay(100);
   Serial.println("P4 TFLite start");
+
+  pinMode(kHandshakePwmPin, OUTPUT);
+  analogWrite(kHandshakePwmPin, kHandshakePwmDuty);
 
   if (kEnableSdLogger) {
     if (kUseSdMmcCustomPins) {
