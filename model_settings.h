@@ -28,8 +28,8 @@ constexpr int kNumChannels = 1;
 constexpr int kMaxImageSize = kNumCols * kNumRows * kNumChannels;
 
 constexpr int kCategoryCount = 2;
-constexpr int kPersonIndex = 1;
-constexpr int kNotAPersonIndex = 0;
+// kCategoryCount must match the number of labels in model_settings.cpp.
+// The training app will export this file with the correct value.
 extern const char* kCategoryLabels[kCategoryCount];
 
 #endif  // TENSORFLOW_LITE_MICRO_EXAMPLES_PERSON_DETECTION_MODEL_SETTINGS_H_
