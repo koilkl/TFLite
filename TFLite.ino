@@ -18,7 +18,10 @@ limitations under the License.
 #include "main_functions.h"
 #include "image_provider.h"
 #include "model_settings.h"
-#include "person_detect_model_data.h"
+// Include the exported model data header.
+// Rename this include to match your exported model's header file name,
+// e.g. "Square_model_data.h" or "MyModel_model_data.h".
+#include "tm_model_data.h"
 #include "tensorflow/lite/micro/micro_log.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -299,22 +302,23 @@ static void uart_tx_task(void *arg) {
 
 static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, uint8_t *confidence) {
   uint8_t best_label = 0;
-  uint8_t best_conf = 0;
+  int best_score = 0;
 
-  if (output->type == kTfLiteInt8) {
-    int8_t s0 = output->data.int8[0];
-    int8_t s1 = output->data.int8[1];
-    best_label = (s1 > s0) ? 1 : 0;
-    best_conf = (uint8_t)((int)output->data.int8[best_label] + 128);
-  } else if (output->type == kTfLiteUInt8) {
-    uint8_t s0 = output->data.uint8[0];
-    uint8_t s1 = output->data.uint8[1];
-    best_label = (s1 > s0) ? 1 : 0;
-    best_conf = output->data.uint8[best_label];
+  for (int i = 0; i < kCategoryCount; i++) {
+    int score = 0;
+    if (output->type == kTfLiteInt8) {
+      score = (int)output->data.int8[i] + 128;
+    } else if (output->type == kTfLiteUInt8) {
+      score = (int)output->data.uint8[i];
+    }
+    if (score > best_score) {
+      best_score = score;
+      best_label = (uint8_t)i;
+    }
   }
 
   *label_id = best_label;
-  *confidence = best_conf;
+  *confidence = (uint8_t)best_score;
 }
 
 static void inference_task(void *arg) {
@@ -439,7 +443,7 @@ void setup() {
 
   // Map the model into a usable data structure. This doesn't involve any
   // copying or parsing, it's a very lightweight operation.
-  model = tflite::GetModel(g_person_detect_model_data);
+  model = tflite::GetModel(g_tm_model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     TF_LITE_REPORT_ERROR(error_reporter,
                          "Model provided is schema version %d not equal "
