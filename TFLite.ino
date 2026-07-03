@@ -122,6 +122,14 @@ struct UartPacket {
   uint8_t flags;
 };
 
+static uint8_t calc_uart_checksum(const uint8_t *data, size_t len) {
+  uint8_t checksum = 0;
+  for (size_t i = 0; i < len; i++) {
+    checksum ^= data[i];
+  }
+  return checksum;
+}
+
 static QueueHandle_t s_uart_queue = nullptr;
 
 struct SdPacket {
@@ -302,7 +310,7 @@ static void uart_tx_task(void *arg) {
       continue;
     }
 
-    uint8_t buf[8];
+    uint8_t buf[9];
     buf[0] = kSync0;
     buf[1] = kSync1;
     buf[2] = kMsgTypeInference;
@@ -311,6 +319,7 @@ static void uart_tx_task(void *arg) {
     buf[5] = pkt.label_id;
     buf[6] = pkt.confidence;
     buf[7] = pkt.flags;
+    buf[8] = calc_uart_checksum(buf, 8);
     UartToS3.write(buf, sizeof(buf));
   }
 }
