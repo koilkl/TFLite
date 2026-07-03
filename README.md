@@ -10,8 +10,9 @@ All parameters below are defined at the top of [TFLite.ino](file:///Users/koil/G
 
 - `kUartBaud`: UART baud rate (default: 921600)
 - `kUartRxPin` / `kUartTxPin`: P4 UART pins (new board default: RX=10, TX=11)
-- Packet format (8 bytes):
-  - `0xAA 0x55` + `msg_type(0x01)` + `frame_id(uint16 LE)` + `label_id(uint8)` + `confidence(uint8)` + `flags(uint8)`
+- Packet format (9 bytes):
+  - `0xAA 0x55` + `msg_type(0x01)` + `frame_id(uint16 LE)` + `label_id(uint8)` + `confidence(uint8)` + `flags(uint8)` + `checksum(uint8)`
+- `checksum` is the XOR of Byte0..Byte7
 
 ### P4 <-> S3 Connection Check (Analog Handshake)
 
