@@ -27,24 +27,33 @@ limitations under the License.
 
 #include "tensorflow/lite/micro/micro_log.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#if __has_include("tensorflow/lite/micro/all_ops_resolver.h")
-#include "tensorflow/lite/micro/all_ops_resolver.h"
-#define TM_HAS_ALL_OPS_RESOLVER 1
-#elif __has_include("tensorflow/lite/micro/kernels/all_ops_resolver.h")
-#include "tensorflow/lite/micro/kernels/all_ops_resolver.h"
-#define TM_HAS_ALL_OPS_RESOLVER 1
-#else
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#define TM_HAS_ALL_OPS_RESOLVER 0
+#if __has_include("model_resolver.h")
+#include "model_resolver.h"
+#define TM_HAS_GENERATED_MODEL_RESOLVER 1
+#else
+#define TM_HAS_GENERATED_MODEL_RESOLVER 0
 #endif
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/system_setup.h"
 
+// Enable ESP-NN acceleration for ESP32-P4 if available.
+// ESP-NN provides optimized Conv2D, DepthwiseConv2D, and FullyConnected
+// kernels using RISC-V SIMD instructions, giving 10-50x speedup over
+// the portable reference kernels.
+#if __has_include("esp_nn.h") && !defined(ESP_NN)
+#define ESP_NN 1
+#endif
+#if __has_include("esp_nn_conv2d.h")
+#include "esp_nn_conv2d.h"
+#endif
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
-
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include <SD_MMC.h>
 #include <FFat.h>
 #include <driver/gpio.h>
@@ -59,6 +68,12 @@ tflite::ErrorReporter* error_reporter = nullptr;
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
+
+// State machine for junction/sign detection
+// State 0 = junction mode (road/cross), State 1 = sign mode (sign classes)
+static int s_detection_state = 0;
+static int s_no_sign_frames = 0;
+static constexpr int kNoSignThreshold = 10;
 
 static HardwareSerial UartToS3(1);
 
@@ -79,8 +94,8 @@ static constexpr uint32_t kInferenceTaskStackBytes = 32 * 1024;
 static constexpr uint32_t kSdTaskStackBytes = 8 * 1024;
 
 static constexpr uint32_t kSaveEveryNFrames = 10;
-static constexpr int kImageWidth = 96;
-static constexpr int kImageHeight = 96;
+static constexpr int kImageWidth = OUT_WIDTH;
+static constexpr int kImageHeight = OUT_WIDTH;
 static constexpr size_t kImageBytes = (size_t)kImageWidth * (size_t)kImageHeight;
 static constexpr size_t kSdQueueDepth = 2;
 static constexpr bool kEnableSdLogger = true;
@@ -95,9 +110,10 @@ static constexpr int kSdD3Pin = -1;
 static constexpr const char *kMountPoint = "/sdcard";
 static constexpr const char *kFfatMountPoint = "/ffat";
 enum class StorageBackend : uint8_t { Auto = 0, SdMmc = 1, FFat = 2 };
-static constexpr StorageBackend kStorageBackend = StorageBackend::Auto;
+static constexpr StorageBackend kStorageBackend = StorageBackend::SdMmc;
 static constexpr bool kFormatFfatOnFail = true;
 
+// extern volatile int s_crop_mode;
 #ifndef BOARD_SDMMC_POWER_PIN
 #define BOARD_SDMMC_POWER_PIN 45
 #endif
@@ -153,8 +169,9 @@ static bool s_sd_full = false;
 // signed value.
 
 // An area of memory to use for input, output, and intermediate arrays.
-constexpr int kTensorArenaSize = 136 * 1024;
-static uint8_t tensor_arena[kTensorArenaSize];
+constexpr int kTensorArenaSize = 375 * 1024; // 380KB — fits P4 sram_high block 
+static uint8_t *tensor_arena=nullptr ;
+
 }  // namespace
 
 static bool mount_sd() {
@@ -324,7 +341,7 @@ static void uart_tx_task(void *arg) {
   }
 }
 
-static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, uint8_t *confidence) {
+static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, uint8_t *confidence, int detection_state) {
   uint8_t best_label = 0;
   int best_score = 0;
 
@@ -334,7 +351,18 @@ static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, u
       score = (int)output->data.int8[i] + 128;
     } else if (output->type == kTfLiteUInt8) {
       score = (int)output->data.uint8[i];
+    } else if (output->type == kTfLiteFloat32) {
+      score = (int)(output->data.f[i] * 255.0f);
     }
+
+    // Per-class masking: in junction mode (0), only road classes (kClassTypes==1);
+    // in sign mode (1), only sign classes (kClassTypes==0).
+    // Classes not matching the current state have their score zeroed.
+    uint8_t expected_type = (detection_state == 0) ? 1 : 0;
+    if (i < kCategoryCount && kClassTypes[i] != expected_type) {
+      score = 0;
+    }
+
     if (score > best_score) {
       best_score = score;
       best_label = (uint8_t)i;
@@ -351,28 +379,87 @@ static void inference_task(void *arg) {
   uint32_t sd_dropped = 0;
   uint8_t next_sd_buffer = 0;
 
+  // Timing accumulators (microseconds)
+  uint64_t total_capture_us = 0;
+  uint64_t total_invoke_us = 0;
+  uint64_t total_loop_us = 0;
+  uint32_t timed_frames = 0;
+
   for (;;) {
     if (!input || !interpreter) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
 
-    if (kTfLiteOk != GetImage(error_reporter, kNumCols, kNumRows, kNumChannels, input->data.int8)) {
+    uint64_t t_loop_start = esp_timer_get_time();
+
+    // Set crop mode based on current detection state
+    SetCropMode(s_detection_state == 0 ? CROP_MODE_JUNCTION : CROP_MODE_SIGN);
+
+    uint64_t t_capture_start = esp_timer_get_time();
+    if (kTfLiteOk != GetImage(error_reporter, OUT_WIDTH, OUT_HEIGHT, kNumChannels, input->data.int8)) {
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
+    uint64_t t_capture_us = esp_timer_get_time() - t_capture_start;
     frame_id++;
 
+    uint64_t t_invoke_start = esp_timer_get_time();
     if (kTfLiteOk != interpreter->Invoke()) {
       Serial.println("Invoke failed");
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
+    uint64_t t_invoke_us = esp_timer_get_time() - t_invoke_start;
+
+    // Accumulate timing
+    total_capture_us += t_capture_us;
+    total_invoke_us += t_invoke_us;
+    total_loop_us += esp_timer_get_time() - t_loop_start;
+    timed_frames++;
 
     TfLiteTensor* output = interpreter->output(0);
     uint8_t label_id = 0;
     uint8_t confidence = 0;
-    pick_label_and_confidence(output, &label_id, &confidence);
+    pick_label_and_confidence(output, &label_id, &confidence, s_detection_state);
+
+    // Debug: print raw output values for first 10 frames to diagnose model output
+    if (frame_id <= 10) {
+      Serial.print("  raw=[");
+      for (int ri = 0; ri < kCategoryCount; ri++) {
+        int raw_score = 0;
+        if (output->type == kTfLiteInt8)       raw_score = (int)output->data.int8[ri] + 128;
+        else if (output->type == kTfLiteUInt8) raw_score = (int)output->data.uint8[ri];
+        else if (output->type == kTfLiteFloat32) raw_score = (int)(output->data.f[ri] * 255.0f);
+        Serial.print(raw_score);
+        if (ri < kCategoryCount - 1) Serial.print(",");
+      }
+      Serial.print("] st=");
+      Serial.print(s_detection_state);
+      Serial.print(" best=");
+      Serial.print(label_id);
+      Serial.print(":");
+      Serial.println(confidence);
+    }
+
+    // State machine: junction <-> sign detection
+    if (s_detection_state == 0) {
+      // Junction mode: if a "road" class is detected with confidence, switch to sign mode
+      if (label_id < kCategoryCount && kClassTypes[label_id] == 1 && confidence > 32) {
+        s_detection_state = 1;
+        s_no_sign_frames = 0;
+      }
+    } else {
+      // Sign mode: if a "sign" class is detected with confidence, stay; otherwise count down
+      if (label_id < kCategoryCount && kClassTypes[label_id] == 0 && confidence > 32) {
+        s_no_sign_frames = 0;
+      } else {
+        s_no_sign_frames++;
+        if (s_no_sign_frames >= kNoSignThreshold) {
+          s_detection_state = 0;  // Switch back to junction mode
+        }
+      }
+    }
 
     if (kEnableSdLogger && s_sd_queue && !s_sd_full && (frame_id % kSaveEveryNFrames) == 0) {
       uint8_t *dst = s_sd_buffers[next_sd_buffer];
@@ -395,28 +482,51 @@ static void inference_task(void *arg) {
       pkt.frame_id = frame_id;
       pkt.label_id = label_id;
       pkt.confidence = confidence;
-      pkt.flags = 0;
+      pkt.flags = (uint8_t)(s_detection_state + 1);  // 1=junction_ready, 2=sign_ready
       xQueueOverwrite(s_uart_queue, &pkt);
     }
 
-    if ((frame_id % 10) == 0) {
+    if ((frame_id % 1) == 0 && timed_frames > 0) {
+      uint32_t avg_cap = (uint32_t)(total_capture_us / timed_frames);
+      uint32_t avg_inv = (uint32_t)(total_invoke_us / timed_frames);
+      uint32_t avg_loop = (uint32_t)(total_loop_us / timed_frames);
       Serial.print("frame=");
       Serial.print(frame_id);
       Serial.print(" label=");
       Serial.print(label_id);
       Serial.print(" conf=");
       Serial.print(confidence);
+      Serial.print(" | cap=");
+      Serial.print(avg_cap / 1000);
+      Serial.print("ms inv=");
+      Serial.print(avg_inv / 1000);
+      Serial.print("ms loop=");
+      Serial.print(avg_loop / 1000);
+      Serial.print("ms fps≈");
+      Serial.print(avg_loop > 0 ? 1000000UL / avg_loop : 0);
+      Serial.print("Chop mode:");
+//    #define CROP_MODE_SIGN     0
+//    #define CROP_MODE_JUNCTION 1
+      if(s_crop_mode==CROP_MODE_JUNCTION)
+      Serial.print("JUN");
+      else
+       Serial.print("SIGN");
       if (kEnableSdLogger) {
         Serial.print(" sd_drop=");
-        Serial.println(sd_dropped);
-      } else {
-        Serial.println();
+        Serial.print(sd_dropped);
       }
+      Serial.println();
+      total_capture_us = 0;
+      total_invoke_us = 0;
+      total_loop_us = 0;
+      timed_frames = 0;
     }
 
     taskYIELD();
   }
 }
+
+
 
 // The name of this function is important for Arduino compatibility.
 void setup() {
@@ -479,27 +589,71 @@ void setup() {
     return;
   }
 
-  #if TM_HAS_ALL_OPS_RESOLVER
-  static tflite::AllOpsResolver micro_op_resolver;
+  #if TM_HAS_GENERATED_MODEL_RESOLVER
+  static ModelOpResolver micro_op_resolver;
+  static bool resolver_registered = false;
+  if (!resolver_registered) {
+    if (RegisterModelOps(micro_op_resolver) != kTfLiteOk) {
+      TF_LITE_REPORT_ERROR(error_reporter, "RegisterModelOps() failed");
+      return;
+    }
+    resolver_registered = true;
+  }
   #else
   static tflite::MicroMutableOpResolver<10> micro_op_resolver;
-  micro_op_resolver.AddAveragePool2D();
-  micro_op_resolver.AddMaxPool2D();
-  micro_op_resolver.AddConv2D();
-  micro_op_resolver.AddDepthwiseConv2D();
-  micro_op_resolver.AddShape();
-  micro_op_resolver.AddStridedSlice();
-  micro_op_resolver.AddPack();
-  micro_op_resolver.AddReshape();
-  micro_op_resolver.AddSoftmax();
-  micro_op_resolver.AddFullyConnected();
+  static bool resolver_registered = false;
+  if (!resolver_registered) {
+    if (micro_op_resolver.AddAveragePool2D() != kTfLiteOk) return;
+    if (micro_op_resolver.AddMaxPool2D() != kTfLiteOk) return;
+    if (micro_op_resolver.AddConv2D() != kTfLiteOk) return;
+    if (micro_op_resolver.AddDepthwiseConv2D() != kTfLiteOk) return;
+    if (micro_op_resolver.AddShape() != kTfLiteOk) return;
+    if (micro_op_resolver.AddStridedSlice() != kTfLiteOk) return;
+    if (micro_op_resolver.AddPack() != kTfLiteOk) return;
+    if (micro_op_resolver.AddReshape() != kTfLiteOk) return;
+    if (micro_op_resolver.AddSoftmax() != kTfLiteOk) return;
+    if (micro_op_resolver.AddFullyConnected() != kTfLiteOk) return;
+    resolver_registered = true;
+  }
   #endif
 
   // Build an interpreter to run the model with.
   // NOLINTNEXTLINE(runtime-global-variables)
+  // Try internal SRAM first (fast, low latency), fall back to PSRAM.
+  // Internal SRAM gives ~10x memory bandwidth over PSRAM — critical for
+  // inference speed. Reduce model size if it doesn't fit
+
+  printf("SRAM free: %d total, %d largest block (requesting %d)\n",
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+      kTensorArenaSize);
+
+  tensor_arena = (uint8_t*) heap_caps_aligned_alloc(
+        16,
+        kTensorArenaSize,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+    );
+  const char *arena_location = "SRAM";
+
+  if (tensor_arena == nullptr) {
+    tensor_arena = (uint8_t*) heap_caps_aligned_alloc(
+          16,
+          kTensorArenaSize,
+          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+      );
+    arena_location = "PSRAM (SRAM full — reduce model size for speed)";
+  }
+
+    if (tensor_arena == nullptr) {
+        printf("Failed to allocate tensor arena!\n");
+        return;
+    }
+    printf("Tensor arena: %d bytes in %s\n", kTensorArenaSize, arena_location);
+
   static tflite::MicroInterpreter static_interpreter(
       model, micro_op_resolver, tensor_arena, kTensorArenaSize, nullptr, nullptr, false);
   interpreter = &static_interpreter;
+
 
   // Allocate memory from the tensor_arena for the model's tensors.
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
@@ -510,6 +664,63 @@ void setup() {
 
   // Get information about the memory area to use for the model's input.
   input = interpreter->input(0);
+
+  // --- Diagnostics ---
+  Serial.print("Arena used: ");
+  Serial.print(interpreter->arena_used_bytes());
+  Serial.print(" / ");
+  Serial.print(kTensorArenaSize);
+  Serial.print(" (");
+  Serial.print((int)(interpreter->arena_used_bytes() * 100LL / kTensorArenaSize));
+  Serial.println("%)");
+
+  Serial.print("Input: ");
+  Serial.print(input->dims->data[1]);
+  Serial.print("x");
+  Serial.print(input->dims->data[2]);
+  Serial.print("x");
+  Serial.print(input->dims->data[3]);
+  Serial.print(" type=");
+  Serial.println(input->type == kTfLiteInt8 ? "int8" : input->type == kTfLiteFloat32 ? "float32" : "other");
+
+  {
+    TfLiteTensor* out = interpreter->output(0);
+    Serial.print("Output: ");
+    Serial.print(out->dims->data[1]);
+    Serial.print(" type=");
+    Serial.print(out->type == kTfLiteInt8 ? "int8" : out->type == kTfLiteUInt8 ? "uint8" : out->type == kTfLiteFloat32 ? "float32" : "other");
+    if (out->type == kTfLiteInt8) {
+      Serial.print(" q=(");
+      Serial.print(out->params.scale);
+      Serial.print(",");
+      Serial.print(out->params.zero_point);
+      Serial.print(")");
+    }
+    Serial.println();
+  }
+
+  Serial.print("Ops: ");
+  auto subgraph = model->subgraphs()->Get(0);
+  auto opcodes = model->operator_codes();
+  for (size_t i = 0; i < subgraph->operators()->size(); i++) {
+    auto op = subgraph->operators()->Get(i);
+    auto opcode = opcodes->Get(op->opcode_index());
+    if (opcode->builtin_code() == tflite::BuiltinOperator_CONV_2D) Serial.print("Conv2D ");
+    else if (opcode->builtin_code() == tflite::BuiltinOperator_MAX_POOL_2D) Serial.print("MaxPool ");
+    else if (opcode->builtin_code() == tflite::BuiltinOperator_FULLY_CONNECTED) Serial.print("FC ");
+    else if (opcode->builtin_code() == tflite::BuiltinOperator_SOFTMAX) Serial.print("Softmax ");
+    else if (opcode->builtin_code() == tflite::BuiltinOperator_RESHAPE) Serial.print("Reshape ");
+    else Serial.print("op#"); Serial.print(opcode->builtin_code()); Serial.print(" ");
+  }
+  Serial.println();
+
+#if defined(ESP_NN)
+  Serial.println("ESP-NN: ENABLED (optimized kernels)");
+#else
+  Serial.println("ESP-NN: NOT FOUND (using reference kernels — SLOW)");
+  Serial.println("Install esp-nn library for 10-50x inference speedup.");
+#endif
+  // --- End Diagnostics ---
 
 #if defined(portNUM_PROCESSORS) && (portNUM_PROCESSORS > 1)
   if (kEnableSdLogger && s_sd_queue) {
