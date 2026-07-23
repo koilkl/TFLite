@@ -78,11 +78,17 @@
 #include "esp_video_device.h"
 #endif
 
-// Constants from main.ino
-#define IMG_WIDTH  1536
-#define IMG_HEIGHT 1232
-#define OUT_WIDTH  96
-#define OUT_HEIGHT 96
+
+volatile int s_crop_mode=CROP_MODE_JUNCTION;
+static int s_last_lut_mode = -1;
+
+void SetCropMode(int mode) {
+    if (mode == CROP_MODE_JUNCTION || mode == CROP_MODE_SIGN) {
+        s_crop_mode = mode;
+        // Kept for backward compat; the ESP32_P4_IMX219 library no longer reads this.
+        g_imx219_crop_mode = mode;
+    }
+}
 
 #if !TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB && __has_include("esp_video_init.h")
 #define TFLITE_P4_IMX219_HAS_ESP_VIDEO 1
@@ -92,6 +98,7 @@
 
 static int *s_x_lut = NULL;
 static int *s_y_lut = NULL;
+static uint32_t s_raw_bytesperline = 0;  // actual V4L2 stride (may differ from IMG_WIDTH*5/4)
 static const char *kTag = "tflite_cam";
 
 #if __has_include("esp_log.h")
@@ -344,44 +351,81 @@ static void tflite_cam_free(void *p) {
 #endif
 
 // Initialize lookup tables for demosaicing and cropping
-static void init_demosaic_luts(int width, int height) {
+static void init_demosaic_luts(int width, int height, int crop_mode) {
     if (s_x_lut == NULL) {
         s_x_lut = (int *)malloc(OUT_WIDTH * sizeof(int));
     }
     if (s_y_lut == NULL) {
         s_y_lut = (int *)malloc(OUT_HEIGHT * sizeof(int));
     }
-    
-    int crop_w = 1232;
-    int crop_h = 1232;
-    int x_offset = (width - crop_w) / 2;
-    int y_offset = (height - crop_h) / 2;
-    
+
+    int crop_w, crop_h, x_offset, y_offset;
+
+    if (crop_mode == CROP_MODE_JUNCTION) {
+        // Junction mode: lower 40%-75% of the image (matches Python _junction_bbox)
+        // For IMG_HEIGHT=1232: y_offset=492, crop_h=432
+        const float junction_top_frac = 0.40f;
+        const float junction_bottom_frac = 0.75f;
+        crop_w = 1232;
+        crop_h = (int)(height * (junction_bottom_frac - junction_top_frac));
+        x_offset = (width - crop_w) / 2;
+        y_offset = (int)(height * junction_top_frac);
+    } else {
+        // Sign mode: ROI-based crop matching Python _sign_search_window
+        // Search window: left 4%-50% width, top 14%-62% height
+        // This focuses on the upper-left portion where traffic signs appear.
+        const float sign_search_left_frac  = 0.04f;
+        const float sign_search_right_frac = 0.50f;
+        const float sign_search_top_frac    = 0.14f;
+        const float sign_search_bottom_frac = 0.62f;
+
+        int search_left   = (int)(width  * sign_search_left_frac);
+        int search_right  = (int)(width  * sign_search_right_frac);
+        int search_top    = (int)(height * sign_search_top_frac);
+        int search_bottom = (int)(height * sign_search_bottom_frac);
+
+        int search_w = search_right - search_left;
+        int search_h = search_bottom - search_top;
+
+        // Take the largest square that fits inside the search window.
+        crop_w = (search_w < search_h) ? search_w : search_h;
+        crop_h = crop_w;
+
+        // Center the crop within the search window.
+        x_offset = search_left + (search_w - crop_w) / 2;
+        y_offset = search_top  + (search_h - crop_h) / 2;
+
+        // Clamp to image bounds.
+        if (x_offset < 0) x_offset = 0;
+        if (y_offset < 0) y_offset = 0;
+        if (x_offset + crop_w > width)  x_offset = width  - crop_w;
+        if (y_offset + crop_h > height) y_offset = height - crop_h;
+    }
+
     float x_step = (float)crop_w / OUT_WIDTH;
     float y_step = (float)crop_h / OUT_HEIGHT;
-    
+
     for (int y = 0; y < OUT_HEIGHT; y++) {
         s_y_lut[y] = (y_offset + (int)(y * y_step + 0.5f)) & ~1;
     }
     for (int x = 0; x < OUT_WIDTH; x++) {
         s_x_lut[x] = (x_offset + (int)(x * x_step + 0.5f)) & ~1;
     }
-    
-    // In a real application, you might want to log this or return status
-    // printf("Sensor: %dx%d, Center crop: %dx%d at offset (%d,%d), Output: %dx%d\n",
-    //          width, height, crop_w, crop_h, x_offset, y_offset, OUT_WIDTH, OUT_HEIGHT);
+
+    s_last_lut_mode = crop_mode;
 }
 
 // Demosaic BGGR raw 10-bit data to RGB
 static void demosaic_bggr_to_rgb(const uint8_t *raw10, uint8_t *rgb, int width, int height) {
-    if (s_x_lut == NULL || s_y_lut == NULL) {
-        init_demosaic_luts(width, height);
+    if (s_x_lut == NULL || s_y_lut == NULL || s_last_lut_mode != s_crop_mode) {
+        init_demosaic_luts(width, height, s_crop_mode);
     }
 
+    int raw_stride = (int)(s_raw_bytesperline > 0 ? s_raw_bytesperline : (uint32_t)(width * 5 / 4));
     for (int y = 0; y < OUT_HEIGHT; y++) {
         int src_y = s_y_lut[y];
-        int row0 = src_y * (width * 5 / 4); // 10-bit raw data, 4 pixels take 5 bytes
-        int row1 = (src_y + 1) * (width * 5 / 4);
+        int row0 = src_y * raw_stride;
+        int row1 = (src_y + 1) * raw_stride;
         int out_row = y * OUT_WIDTH;
         for (int x = 0; x < OUT_WIDTH; x++) {
             int src_x = s_x_lut[x];
@@ -457,7 +501,7 @@ static TfLiteStatus camera_init_if_needed(tflite::ErrorReporter* error_reporter)
   }
 
   if (s_x_lut == NULL || s_y_lut == NULL) {
-    init_demosaic_luts(IMG_WIDTH, IMG_HEIGHT);
+    init_demosaic_luts(IMG_WIDTH, IMG_HEIGHT, CROP_MODE_SIGN);
   }
 
 #if __has_include("nvs_flash.h")
@@ -511,6 +555,7 @@ static TfLiteStatus camera_init_if_needed(tflite::ErrorReporter* error_reporter)
     camera_deinit();
     return kTfLiteError;
   }
+  s_raw_bytesperline = fmt.fmt.pix.bytesperline;
   log_v4l2_capture_fmt("applied", &fmt);
 
   struct v4l2_requestbuffers req;
@@ -629,6 +674,7 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
 
 #if TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB
   static bool s_backend_logged = false;
+  static bool s_gray_size_logged = false;
   if (!s_backend_logged) {
     s_backend_logged = true;
     TFLITE_CAM_LOGI("GetImage backend: arduino_imx219_lib");
@@ -662,8 +708,89 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     return kTfLiteError;
   }
 
-  for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-    image_data[i] = (int8_t)((int)gray_u8[i] - 128);
+  // Determine the actual capture resolution from the library.
+  // The Arduino IMX219 library now provides a full-frame downsampled
+  // grayscale buffer (no ROI crop).  We infer the source size from the
+  // byte count and apply software crop matching the Python training pipeline.
+  int src_side = 1;
+  while (src_side * src_side < (int)gray_size) src_side++;
+
+  if (!s_gray_size_logged) {
+    s_gray_size_logged = true;
+    TFLITE_CAM_LOGI("gray buffer: %u bytes (%dx%d src), out=%dx%d crop_mode=%d",
+                    (unsigned)gray_size, src_side, src_side, OUT_WIDTH, OUT_HEIGHT, s_crop_mode);
+    TFLITE_CAM_LOGI("Arduino IMX219 library: full-frame downsize; software crop applied here.");
+  }
+
+  // Helper: crop + nearest-neighbor resize from src_side×src_side → OUT_WIDTH×OUT_HEIGHT.
+  // Crop region matches the Python training pipeline (image_preprocess.py).
+  int crop_x1, crop_y1, crop_x2, crop_y2;
+  if (s_crop_mode == CROP_MODE_JUNCTION) {
+    // Junction mode: lower 40%-75% of height, full width (matches Python _junction_bbox).
+    crop_x1 = 0;
+    crop_x2 = src_side;
+    crop_y1 = (int)(src_side * 0.40f);
+    crop_y2 = (int)(src_side * 0.75f);
+  } else {
+    // Sign mode (default): upper-left search window (matches Python _sign_search_window).
+    // Search window: left 4%-50% width, top 14%-62% height.
+    crop_x1 = (int)(src_side * 0.04f);
+    crop_x2 = (int)(src_side * 0.50f);
+    crop_y1 = (int)(src_side * 0.14f);
+    crop_y2 = (int)(src_side * 0.62f);
+  }
+  int crop_w = crop_x2 - crop_x1;
+  int crop_h = crop_y2 - crop_y1;
+  if (crop_w < 1) crop_w = 1;
+  if (crop_h < 1) crop_h = 1;
+
+  // Fill output with black (int8 minimum = -128) first, so any region not
+  // covered by the crop render stays black (matching Python ImageOps.pad).
+  memset(image_data, -128, OUT_WIDTH * OUT_HEIGHT);
+
+  if (s_crop_mode == CROP_MODE_JUNCTION) {
+    // Junction mode: preserve aspect ratio + pad with black bars.
+    // Matches Python _render_crop with preserve_aspect=True (ImageOps.pad).
+    // The crop is typically wider than tall (e.g. full width × 35% height),
+    // so we fit by width and center vertically.
+    int scaled_h = crop_h * OUT_WIDTH / crop_w;
+    if (scaled_h > OUT_HEIGHT) {
+      // Crop is taller than output — fit by height instead.
+      int scaled_w = crop_w * OUT_HEIGHT / crop_h;
+      int off_x = (OUT_WIDTH - scaled_w) / 2;
+      for (int y = 0; y < OUT_HEIGHT; y++) {
+        int src_y = crop_y1 + y * crop_h / OUT_HEIGHT;
+        if (src_y >= src_side) src_y = src_side - 1;
+        for (int x = 0; x < scaled_w; x++) {
+          int src_x = crop_x1 + x * crop_w / scaled_w;
+          if (src_x >= src_side) src_x = src_side - 1;
+          image_data[y * OUT_WIDTH + off_x + x] = (int8_t)((int)gray_u8[src_y * src_side + src_x] - 128);
+        }
+      }
+    } else {
+      // Fit by width, center vertically.
+      int off_y = (OUT_HEIGHT - scaled_h) / 2;
+      for (int y = 0; y < scaled_h; y++) {
+        int src_y = crop_y1 + y * crop_h / scaled_h;
+        if (src_y >= src_side) src_y = src_side - 1;
+        for (int x = 0; x < OUT_WIDTH; x++) {
+          int src_x = crop_x1 + x * crop_w / OUT_WIDTH;
+          if (src_x >= src_side) src_x = src_side - 1;
+          image_data[(off_y + y) * OUT_WIDTH + x] = (int8_t)((int)gray_u8[src_y * src_side + src_x] - 128);
+        }
+      }
+    }
+  } else {
+    // Sign mode: stretch to fill (matching Python preserve_aspect=False).
+    for (int y = 0; y < OUT_HEIGHT; y++) {
+      int src_y = crop_y1 + y * crop_h / OUT_HEIGHT;
+      if (src_y >= src_side) src_y = src_side - 1;
+      for (int x = 0; x < OUT_WIDTH; x++) {
+        int src_x = crop_x1 + x * crop_w / OUT_WIDTH;
+        if (src_x >= src_side) src_x = src_side - 1;
+        image_data[y * OUT_WIDTH + x] = (int8_t)((int)gray_u8[src_y * src_side + src_x] - 128);
+      }
+    }
   }
 
   return kTfLiteOk;
