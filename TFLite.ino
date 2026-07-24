@@ -71,9 +71,31 @@ TfLiteTensor* input = nullptr;
 
 // State machine for junction/sign detection
 // State 0 = junction mode (road/cross), State 1 = sign mode (sign classes)
-static int s_detection_state = 0;
-static int s_no_sign_frames = 0;
+// volatile: written by uart_rx_task (core 0) on RESUME_JUNCTION, read by
+// inference_task (core 1) every frame — prevents the core-1 compiler from
+// caching a stale value in a register.
+static volatile int s_detection_state = 0;
+static volatile int s_no_sign_frames = 0;
 static constexpr int kNoSignThreshold = 10;
+
+// Bi-directional control: S3 can request P4 to stop/start UART transmission.
+// Inference continues regardless; only the TX path is gated.
+static volatile bool s_transmit_enabled = true;
+
+// RX diagnostics: count bytes and control packets received from S3.
+static volatile uint32_t s_rx_bytes = 0;
+static volatile uint32_t s_rx_ack_stop = 0;
+static volatile uint32_t s_rx_resume_junction = 0;
+
+static void uart_control_enable() {
+  s_transmit_enabled = true;
+  Serial.println("UART TX: ENABLED");
+}
+
+static void uart_control_disable() {
+  s_transmit_enabled = false;
+  Serial.println("UART TX: DISABLED (S3 ack)");
+}
 
 static HardwareSerial UartToS3(1);
 
@@ -88,8 +110,14 @@ static constexpr int kHandshakePwmDuty = 255;
 static constexpr uint8_t kSync0 = 0xAA;
 static constexpr uint8_t kSync1 = 0x55;
 static constexpr uint8_t kMsgTypeInference = 0x01;
+static constexpr uint8_t kMsgTypeControl   = 0x02;  // S3 → P4 control messages
+
+// S3 → P4 control commands
+static constexpr uint8_t kCtrlAckStop        = 0x01;  // S3 confirmed sign → stop TX
+static constexpr uint8_t kCtrlResumeJunction = 0x02;  // S3 done → resume TX + junction mode
 
 static constexpr uint32_t kUartTxTaskStackBytes = 4 * 1024;
+static constexpr uint32_t kUartRxTaskStackBytes = 4 * 1024;
 static constexpr uint32_t kInferenceTaskStackBytes = 32 * 1024;
 static constexpr uint32_t kSdTaskStackBytes = 8 * 1024;
 
@@ -327,6 +355,10 @@ static void uart_tx_task(void *arg) {
       continue;
     }
 
+    if (!s_transmit_enabled) {
+      continue;  // silently drop — S3 hasn't asked us to resume yet
+    }
+
     uint8_t buf[9];
     buf[0] = kSync0;
     buf[1] = kSync1;
@@ -338,6 +370,101 @@ static void uart_tx_task(void *arg) {
     buf[7] = pkt.flags;
     buf[8] = calc_uart_checksum(buf, 8);
     UartToS3.write(buf, sizeof(buf));
+  }
+}
+
+static void uart_rx_task(void *arg) {
+  (void)arg;
+  // State machine for reading 5-byte control packets from S3:
+  //   [0xAA, 0x55, 0x02, cmd, checksum]
+  static uint8_t rx_buf[5];
+  static uint8_t rx_idx = 0;
+  static uint8_t rx_state = 0;  // 0=wait sync0, 1=wait sync1, 2=wait rest
+
+  uint32_t last_rx_log_ms = 0;
+
+  for (;;) {
+    while (UartToS3.available() > 0) {
+      uint8_t b = (uint8_t)UartToS3.read();
+      s_rx_bytes++;
+
+      if (rx_state == 0) {
+        if (b == kSync0) {
+          rx_buf[0] = b;
+          rx_idx = 1;
+          rx_state = 1;
+        }
+        continue;
+      }
+
+      if (rx_state == 1) {
+        if (b == kSync1) {
+          rx_buf[1] = b;
+          rx_idx = 2;
+          rx_state = 2;
+        } else if (b == kSync0) {
+          rx_buf[0] = b;
+          rx_idx = 1;
+          rx_state = 1;
+        } else {
+          rx_state = 0;
+        }
+        continue;
+      }
+
+      // rx_state == 2: collecting remaining bytes
+      rx_buf[rx_idx++] = b;
+      if (rx_idx < sizeof(rx_buf)) {
+        continue;
+      }
+
+      // Full packet received
+      rx_state = 0;
+      rx_idx = 0;
+
+      if (rx_buf[2] != kMsgTypeControl) {
+        Serial.printf("UART RX: unknown msg_type 0x%02X (expected 0x%02X)\n",
+                      rx_buf[2], kMsgTypeControl);
+        continue;
+      }
+
+      // Verify checksum: XOR of bytes 0-3
+      uint8_t expected_csum = calc_uart_checksum(rx_buf, 4);
+      if (rx_buf[4] != expected_csum) {
+        Serial.printf("UART RX: bad checksum (got 0x%02X expected 0x%02X)\n",
+                      rx_buf[4], expected_csum);
+        continue;
+      }
+
+      uint8_t cmd = rx_buf[3];
+
+      if (cmd == kCtrlAckStop) {
+        s_rx_ack_stop++;
+        Serial.printf("UART RX: ACK_STOP from S3 (#%lu) — disabling TX\n",
+                      (unsigned long)s_rx_ack_stop);
+        uart_control_disable();
+      } else if (cmd == kCtrlResumeJunction) {
+        s_rx_resume_junction++;
+        Serial.printf("UART RX: RESUME_JUNCTION from S3 (#%lu) — resuming TX + junction mode\n",
+                      (unsigned long)s_rx_resume_junction);
+        s_detection_state = 0;
+        s_no_sign_frames = 0;
+        uart_control_enable();
+      } else {
+        Serial.printf("UART RX: unknown control cmd 0x%02X\n", cmd);
+      }
+    }
+
+    // Periodic heartbeat: show RX stats even when idle
+    uint32_t now = millis();
+    if (now - last_rx_log_ms >= 5000) {
+      last_rx_log_ms = now;
+      Serial.printf("UART RX: bytes=%lu ack_stop=%lu resume=%lu tx_enabled=%d\n",
+                    (unsigned long)s_rx_bytes, (unsigned long)s_rx_ack_stop,
+                    (unsigned long)s_rx_resume_junction, (int)s_transmit_enabled);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -511,6 +638,10 @@ static void inference_task(void *arg) {
       Serial.print("JUN");
       else
        Serial.print("SIGN");
+      Serial.print(" tx=");
+      Serial.print(s_transmit_enabled ? "ON" : "OFF");
+      Serial.print(" rx_bytes=");
+      Serial.print((unsigned long)s_rx_bytes);
       if (kEnableSdLogger) {
         Serial.print(" sd_drop=");
         Serial.print(sd_dropped);
@@ -727,12 +858,14 @@ void setup() {
     xTaskCreatePinnedToCore(sd_task, "sd", kSdTaskStackBytes, nullptr, 1, nullptr, 0);
   }
   xTaskCreatePinnedToCore(uart_tx_task, "uart_tx", kUartTxTaskStackBytes, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", kUartRxTaskStackBytes, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, nullptr, 1);
 #else
   if (kEnableSdLogger && s_sd_queue) {
     xTaskCreate(sd_task, "sd", kSdTaskStackBytes, nullptr, 1, nullptr);
   }
   xTaskCreate(uart_tx_task, "uart_tx", kUartTxTaskStackBytes, nullptr, 2, nullptr);
+  xTaskCreate(uart_rx_task, "uart_rx", kUartRxTaskStackBytes, nullptr, 2, nullptr);
   xTaskCreate(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, nullptr);
 #endif
 }
