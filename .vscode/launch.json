@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/koil/Google-Teachable-Machine-TFLite-model-training/TFLite",
+      "program": "/Users/koil/Google-Teachable-Machine-TFLite-model-training/TFLite/build/Debug/outDebug"
+    }
+  ]
+}
