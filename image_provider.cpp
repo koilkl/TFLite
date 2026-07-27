@@ -885,33 +885,8 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++)
       image_data[i] = (int8_t)((int)bg_u8[i] - 128);
   } else {
-    // ---- Step 4: centroid & spread → crop bbox ----
-    int cx_w = (int)(sum_wx / sum_w);
-    int cy_w = (int)(sum_wy / sum_w);
-    // Variance = E[X²] - E[X]²
-    int64_t mean_x  = (int64_t)cx_w;
-    int64_t mean_y  = (int64_t)cy_w;
-    int64_t var_x = (int64_t)(sum_wx2 / sum_w) - mean_x * mean_x;
-    int64_t var_y = (int64_t)(sum_wy2 / sum_w) - mean_y * mean_y;
-    if (var_x < 1) var_x = 1;
-    if (var_y < 1) var_y = 1;
-    int std_x = int_sqrt((int)var_x);
-    int std_y = int_sqrt((int)var_y);
-    int max_std = (std_x > std_y) ? std_x : std_y;
-
-    int side = max_std * 4;
-    int min_side = (OUT_WIDTH < OUT_HEIGHT ? OUT_WIDTH : OUT_HEIGHT) * 12 / 100;
-    int max_side = (OUT_WIDTH < OUT_HEIGHT ? OUT_WIDTH : OUT_HEIGHT) * 85 / 100;
-    if (side < min_side) side = min_side;
-    if (side > max_side) side = max_side;
-    int half = side / 2;
-
-    int crop_x1 = cx_w - half;  if (crop_x1 < 0) crop_x1 = 0;
-    int crop_y1 = cy_w - half;  if (crop_y1 < 0) crop_y1 = 0;
-    int crop_w  = side;         if (crop_x1 + crop_w > OUT_WIDTH)  crop_w = OUT_WIDTH  - crop_x1;
-    int crop_h  = side;         if (crop_y1 + crop_h > OUT_HEIGHT) crop_h = OUT_HEIGHT - crop_y1;
-
     // ---- Step 5: nearest-neighbour resize crop → 96×96 ----
+    // crop_x1/y1/w/h already set by blob detection above
     for (int y = 0; y < OUT_HEIGHT; y++) {
       int src_y = crop_y1 + y * crop_h / OUT_HEIGHT;
       if (src_y >= OUT_HEIGHT) src_y = OUT_HEIGHT - 1;
