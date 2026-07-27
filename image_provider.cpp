@@ -677,7 +677,7 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   static bool s_gray_size_logged = false;
   if (!s_backend_logged) {
     s_backend_logged = true;
-    TFLITE_CAM_LOGI("GetImage backend: arduino_imx219_lib");
+    TFLITE_CAM_LOGI("GetImage backend: arduino_imx219_lib  (B-G diff mode)");
   }
   static bool s_ok = false;
   if (!s_ok) {
@@ -701,13 +701,46 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     return kTfLiteError;
   }
 
-  const uint8_t *gray_u8 = esp32_p4_imx219_gray();
-  const size_t gray_size = esp32_p4_imx219_gray_size();
-  if (!gray_u8 || gray_size < (size_t)(OUT_WIDTH * OUT_HEIGHT)) {
-    TF_LITE_REPORT_ERROR(error_reporter, "invalid gray buffer");
-    return kTfLiteError;
+  // ── B-G difference pipeline ──
+  // Blue / purple signs → high B, low G → B-G is large positive.
+  // Green objects / foliage → low B, high G → B-G is negative.
+  // Grey background (road / wall / sky) → B ≈ G → B-G ≈ 0.
+  // Mapping:  diff ∈ [-255, 255]  →  gray = (diff + 255) / 2  →  [0, 255].
+  //
+  // ROI detection: purple mask (min(R,B) > G + margin) → morphology →
+  // largest blob → crop.  Much more specific than a bare B-G threshold.
+  //
+  // This pipeline runs IDENTICALLY in AItraining/image_preprocess.py.
+  // Any change here MUST be mirrored there.
+  static constexpr uint16_t kTfWbRed  = 200;
+  static constexpr uint16_t kTfWbBlue = 200;
+  const uint8_t *rgb = esp32_p4_imx219_rgb_wb(kTfWbRed, kTfWbBlue);
+
+  // ---- Step 0: get WB-corrected RGB from library ----
+  // Gains must match AItraining/image_preprocess.py and the example sketch.
+  static constexpr uint16_t kTfWbRed  = 200;  // ×2.0
+  static constexpr uint16_t kTfWbBlue = 200;
+  const uint8_t *rgb = esp32_p4_imx219_rgb_wb(kTfWbRed, kTfWbBlue);
+  // (no need to check rgb_size — rgb_wb always returns a valid pointer)
+
+  // ---- Step 1: B-G extraction → raw grayscale ----
+  static int16_t bg_raw[OUT_WIDTH * OUT_HEIGHT];   // signed B-G values
+  static uint8_t bg_u8[OUT_WIDTH * OUT_HEIGHT];
+  for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+    int r = rgb[i * 3 + 0];
+    int g = rgb[i * 3 + 1];
+    int b = rgb[i * 3 + 2];
+    // Pure-black areas (shadows, dark pipes) can't be a sign.
+    // Push their B-G to 255 so they don't interfere with stretch / threshold.
+    if (r < 10 && g < 10 && b < 10) {
+      bg_raw[i] = 0;  bg_u8[i] = 128;  continue;   // pure black → neutral
+    }
+    int diff = b - g;  // WB already applied by rgb_wb()
+    bg_raw[i] = (int16_t)diff;
+    bg_u8[i]  = (uint8_t)((diff + 255) / 2);
   }
 
+<<<<<<< Updated upstream
   // Determine the actual capture resolution from the library.
   // The Arduino IMX219 library now provides a full-frame downsampled
   // grayscale buffer (no ROI crop).  We infer the source size from the
@@ -789,6 +822,210 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
         int src_x = crop_x1 + x * crop_w / OUT_WIDTH;
         if (src_x >= src_side) src_x = src_side - 1;
         image_data[y * OUT_WIDTH + x] = (int8_t)((int)gray_u8[src_y * src_side + src_x] - 128);
+=======
+  // ---- Step 2: 5×5 box blur → contrast stretch → binary mask ----
+  static int16_t bg_blur[OUT_WIDTH * OUT_HEIGHT];
+  int16_t bg_min = 32767, bg_max = -32768;
+  for (int y = 2; y < OUT_HEIGHT - 2; y++) {
+    for (int x = 2; x < OUT_WIDTH - 2; x++) {
+      int sum = 0;
+      for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++)
+          sum += bg_raw[(y + dy) * OUT_WIDTH + (x + dx)];
+      int16_t v = (int16_t)(sum / 25);
+      int idx = y * OUT_WIDTH + x;
+      bg_blur[idx] = v;
+      if (v < bg_min) bg_min = v;
+      if (v > bg_max) bg_max = v;
+    }
+  }
+
+  // Contrast stretch blurred B-G to [0,255]
+  int bg_span = (int)bg_max - (int)bg_min;
+  static uint8_t mask[OUT_WIDTH * OUT_HEIGHT];
+  bool any_signal = (bg_span >= 20);   // need meaningful contrast
+  if (any_signal) {
+    for (int y = 2; y < OUT_HEIGHT - 2; y++) {
+      for (int x = 2; x < OUT_WIDTH - 2; x++) {
+        int idx = y * OUT_WIDTH + x;
+        int stretched = ((int)bg_blur[idx] - (int)bg_min) * 255 / bg_span;
+        // Sign is BRIGHTER than background (higher B-G after WB) → above midpoint
+        mask[idx] = (stretched > 80) ? 255 : 0;    // lower = more sensitive
+      }
+    }
+  }
+
+  // ---- Step 2: morphological clean-up (if any purple pixels) ----
+  int crop_x1 = 0, crop_y1 = 0, crop_w = OUT_WIDTH, crop_h = OUT_HEIGHT;
+  bool found_roi = false;
+
+  if (any_signal) {
+    // 2a. 3×3 erosion (remove isolated noise)
+    static uint8_t tmp[OUT_WIDTH * OUT_HEIGHT];
+    for (int y = 1; y < OUT_HEIGHT - 1; y++) {
+      for (int x = 1; x < OUT_WIDTH - 1; x++) {
+        int idx = y * OUT_WIDTH + x;
+        tmp[idx] = (mask[idx] && mask[idx - 1] && mask[idx + 1]
+                 && mask[idx - OUT_WIDTH] && mask[idx + OUT_WIDTH]) ? 255 : 0;
+      }
+    }
+    // 2b. 3×3 dilation ×2 (reconnect fragments)
+    for (int pass = 0; pass < 2; pass++) {
+      for (int y = 1; y < OUT_HEIGHT - 1; y++) {
+        for (int x = 1; x < OUT_WIDTH - 1; x++) {
+          int idx = y * OUT_WIDTH + x;
+          mask[idx] = tmp[idx];  // copy back
+          tmp[idx] = (mask[idx] || mask[idx - 1] || mask[idx + 1]
+                   || mask[idx - OUT_WIDTH] || mask[idx + OUT_WIDTH]) ? 255 : 0;
+        }
+      }
+      // swap
+      for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+        uint8_t s = mask[i]; mask[i] = tmp[i]; tmp[i] = s;
+      }
+    }
+
+    // ---- Step 3: find largest connected component (row-by-row run-length) ----
+    // We use a simple two-pass approach: first find all runs, then merge
+    // overlapping runs across rows using a union-find label table.
+    #define MAX_RUNS 512
+    struct { int x1, x2, y, label; } runs[MAX_RUNS];
+    int num_runs = 0;
+
+    // First pass: extract runs
+    for (int y = 1; y < OUT_HEIGHT - 1 && num_runs < MAX_RUNS; y++) {
+      int x = 1;
+      while (x < OUT_WIDTH - 1) {
+        while (x < OUT_WIDTH - 1 && !mask[y * OUT_WIDTH + x]) x++;
+        if (x >= OUT_WIDTH - 1) break;
+        int x1 = x;
+        while (x < OUT_WIDTH - 1 && mask[y * OUT_WIDTH + x]) x++;
+        runs[num_runs].x1 = x1;
+        runs[num_runs].x2 = x - 1;
+        runs[num_runs].y  = y;
+        runs[num_runs].label = num_runs;  // self-label initially
+        num_runs++;
+      }
+    }
+
+    if (num_runs > 1) {
+      // Merge overlapping runs on adjacent rows
+      int parent[MAX_RUNS];
+      for (int i = 0; i < num_runs; i++) parent[i] = i;
+      auto find = [&](int a) { while (parent[a] != a) a = parent[a]; return a; };
+      auto unite = [&](int a, int b) { parent[find(a)] = find(b); };
+
+      for (int i = 0; i < num_runs; i++) {
+        for (int j = i + 1; j < num_runs; j++) {
+          if (runs[j].y > runs[i].y + 1) break;  // not adjacent row
+          if (runs[j].y == runs[i].y + 1
+              && runs[j].x1 <= runs[i].x2 && runs[j].x2 >= runs[i].x1)
+            unite(i, j);
+        }
+      }
+
+      // Count component sizes
+      int comp_size[MAX_RUNS] = {0};
+      for (int i = 0; i < num_runs; i++) {
+        int root = find(i);
+        comp_size[root] += runs[i].x2 - runs[i].x1 + 1;
+      }
+
+      // Find largest component
+      int best_root = 0, best_size = 0;
+      for (int i = 0; i < num_runs; i++) {
+        int root = find(i);
+        if (comp_size[root] > best_size) {
+          best_size = comp_size[root];
+          best_root = root;
+        }
+      }
+
+      if (best_size >= 16) {
+        // Compute bbox of largest component
+        int min_x = OUT_WIDTH, min_y = OUT_HEIGHT, max_x = 0, max_y = 0;
+        for (int i = 0; i < num_runs; i++) {
+          if (find(i) == best_root) {
+            if (runs[i].x1 < min_x) min_x = runs[i].x1;
+            if (runs[i].x2 > max_x) max_x = runs[i].x2;
+            if (runs[i].y  < min_y) min_y = runs[i].y;
+            if (runs[i].y  > max_y) max_y = runs[i].y;
+          }
+        }
+        int bw = max_x - min_x + 1, bh = max_y - min_y + 1;
+        int side = (bw > bh) ? bw : bh;
+        int pad = side / 5; if (pad < 1) pad = 1;
+        side += pad * 2;
+        int ccx = (min_x + max_x) / 2, ccy = (min_y + max_y) / 2;
+        int half = side / 2;
+        crop_x1 = ccx - half; if (crop_x1 < 0) crop_x1 = 0;
+        crop_y1 = ccy - half; if (crop_y1 < 0) crop_y1 = 0;
+        crop_w  = side;       if (crop_x1 + crop_w > OUT_WIDTH)  crop_w = OUT_WIDTH  - crop_x1;
+        crop_h  = side;       if (crop_y1 + crop_h > OUT_HEIGHT) crop_h = OUT_HEIGHT - crop_y1;
+        if (crop_w >= 8 && crop_h >= 8) found_roi = true;
+      }
+    }
+  }
+
+  // ---- Step 4: resize crop (or full frame) → 96×96 ----
+  if (!found_roi) {
+    // No purple region found → use full frame
+    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++)
+      image_data[i] = (int8_t)((int)bg_u8[i] - 128);
+  } else {
+    // ---- Step 4: centroid & spread → crop bbox ----
+    int cx_w = (int)(sum_wx / sum_w);
+    int cy_w = (int)(sum_wy / sum_w);
+    // Variance = E[X²] - E[X]²
+    int64_t mean_x  = (int64_t)cx_w;
+    int64_t mean_y  = (int64_t)cy_w;
+    int64_t var_x = (int64_t)(sum_wx2 / sum_w) - mean_x * mean_x;
+    int64_t var_y = (int64_t)(sum_wy2 / sum_w) - mean_y * mean_y;
+    if (var_x < 1) var_x = 1;
+    if (var_y < 1) var_y = 1;
+    int std_x = int_sqrt((int)var_x);
+    int std_y = int_sqrt((int)var_y);
+    int max_std = (std_x > std_y) ? std_x : std_y;
+
+    int side = max_std * 4;
+    int min_side = (OUT_WIDTH < OUT_HEIGHT ? OUT_WIDTH : OUT_HEIGHT) * 12 / 100;
+    int max_side = (OUT_WIDTH < OUT_HEIGHT ? OUT_WIDTH : OUT_HEIGHT) * 85 / 100;
+    if (side < min_side) side = min_side;
+    if (side > max_side) side = max_side;
+    int half = side / 2;
+
+    int crop_x1 = cx_w - half;  if (crop_x1 < 0) crop_x1 = 0;
+    int crop_y1 = cy_w - half;  if (crop_y1 < 0) crop_y1 = 0;
+    int crop_w  = side;         if (crop_x1 + crop_w > OUT_WIDTH)  crop_w = OUT_WIDTH  - crop_x1;
+    int crop_h  = side;         if (crop_y1 + crop_h > OUT_HEIGHT) crop_h = OUT_HEIGHT - crop_y1;
+
+    // ---- Step 5: nearest-neighbour resize crop → 96×96 ----
+    for (int y = 0; y < OUT_HEIGHT; y++) {
+      int src_y = crop_y1 + y * crop_h / OUT_HEIGHT;
+      if (src_y >= OUT_HEIGHT) src_y = OUT_HEIGHT - 1;
+      for (int x = 0; x < OUT_WIDTH; x++) {
+        int src_x = crop_x1 + x * crop_w / OUT_WIDTH;
+        if (src_x >= OUT_WIDTH) src_x = OUT_WIDTH - 1;
+        image_data[y * OUT_WIDTH + x] = (int8_t)((int)bg_u8[src_y * OUT_WIDTH + src_x] - 128);
+      }
+    }
+  }
+
+  // ---- Step 6: contrast stretch ----
+  {
+    uint8_t min_val = 255, max_val = 0;
+    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+      uint8_t v = (uint8_t)((int)image_data[i] + 128);
+      if (v < min_val) min_val = v;
+      if (v > max_val) max_val = v;
+    }
+    int span = (int)max_val - (int)min_val;
+    if (span >= 24) {
+      for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+        uint8_t v = (uint8_t)((int)image_data[i] + 128);
+        int stretched = ((int)v - (int)min_val) * 255 / span;
+        image_data[i] = (int8_t)(stretched - 128);
+>>>>>>> Stashed changes
       }
     }
   }
@@ -831,10 +1068,34 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   const uint8_t *raw_data = (const uint8_t *)s_mapped_bufs[buf_dq.index];
   demosaic_bggr_to_rgb(raw_data, s_rgb_buf, IMG_WIDTH, IMG_HEIGHT);
 
-  uint8_t gray_u8[OUT_WIDTH * OUT_HEIGHT];
-  rgb_to_gray(s_rgb_buf, gray_u8, OUT_WIDTH * OUT_HEIGHT);
+  // B-G difference pipeline — same as main backend.
+  // (Simplified: no blob detection; V4L2 backend is for debug / fallback.)
   for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-    image_data[i] = (int8_t)((int)gray_u8[i] - 128);
+    int r = s_rgb_buf[i * 3 + 0];
+    int g = s_rgb_buf[i * 3 + 1];
+    int b = s_rgb_buf[i * 3 + 2];
+    r = (int)((float)r * 2.0f); if (r > 255) r = 255;  // WB
+    b = (int)((float)b * 2.0f); if (b > 255) b = 255;
+    int diff = b - g;
+    uint8_t gray = (uint8_t)((diff + 255) / 2);
+    image_data[i] = (int8_t)(gray - 128);
+  }
+  // Contrast stretch
+  {
+    uint8_t min_val = 255, max_val = 0;
+    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+      uint8_t v = (uint8_t)((int)image_data[i] + 128);
+      if (v < min_val) min_val = v;
+      if (v > max_val) max_val = v;
+    }
+    int span = (int)max_val - (int)min_val;
+    if (span >= 24) {
+      for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+        uint8_t v = (uint8_t)((int)image_data[i] + 128);
+        int stretched = ((int)v - (int)min_val) * 255 / span;
+        image_data[i] = (int8_t)(stretched - 128);
+      }
+    }
   }
 
   if (ioctl(s_fd, VIDIOC_QBUF, &buf_dq) != 0) {
