@@ -712,65 +712,27 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   //
   // This pipeline runs IDENTICALLY in AItraining/image_preprocess.py.
   // Any change here MUST be mirrored there.
+  static constexpr uint16_t kTfWbRed  = 200;  // ×2.0
+  static constexpr uint16_t kTfWbBlue = 200;
+  const uint8_t *rgb = esp32_p4_imx219_rgb_wb(kTfWbRed, kTfWbBlue);
 
-  // ── Auto White Balance ──
-  // Gray World algorithm: assume average scene colour is grey, compute
-  // per-channel gains to make R_avg = G_avg = B_avg.
-  // Gains are temporally smoothed (IIR) so they don't jump frame-to-frame.
-  static uint16_t s_wb_red  = 200;   // ×2.0  (startup default)
-  static uint16_t s_wb_blue = 200;
+  // (no need to check rgb_size — rgb_wb always returns a valid pointer)
 
-  // Get RAW RGB — no library-side WB, we apply our own below.
-  const uint8_t *rgb = esp32_p4_imx219_rgb();
-
-  // ---- Step 1: B-G extraction + AWB accumulation ----
+  // ---- Step 1: B-G extraction → raw grayscale ----
   static int16_t bg_raw[OUT_WIDTH * OUT_HEIGHT];   // signed B-G values
   static uint8_t bg_u8[OUT_WIDTH * OUT_HEIGHT];
-  int64_t sum_r = 0, sum_g = 0, sum_b = 0;
-  int awb_count = 0;
-
   for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-    int r_raw = rgb[i * 3 + 0];
-    int g_raw = rgb[i * 3 + 1];
-    int b_raw = rgb[i * 3 + 2];
-
-    // Accumulate for AWB (skip pure-black — shadows skew the average)
-    if (!(r_raw < 10 && g_raw < 10 && b_raw < 10)) {
-      sum_r += r_raw;  sum_g += g_raw;  sum_b += b_raw;
-      awb_count++;
-    }
-
-    // Apply current WB gains
-    int r = (r_raw * (int)s_wb_red)  / 100;
-    int b = (b_raw * (int)s_wb_blue) / 100;
-    int g = g_raw;   // green is the reference channel
-    if (r > 255) r = 255;
-    if (b > 255) b = 255;
-
-    // Pure-black areas → neutral (won't interfere with stretch / threshold)
+    int r = rgb[i * 3 + 0];
+    int g = rgb[i * 3 + 1];
+    int b = rgb[i * 3 + 2];
+    // Pure-black areas (shadows) can't be a sign.
+    // Push their B-G to neutral so they don't interfere with stretch / threshold.
     if (r < 10 && g < 10 && b < 10) {
       bg_raw[i] = 0;  bg_u8[i] = 128;  continue;
     }
-    int diff = b - g;
+    int diff = b - g;  // WB already applied by rgb_wb()
     bg_raw[i] = (int16_t)diff;
     bg_u8[i]  = (uint8_t)((diff + 255) / 2);
-  }
-
-  // Update AWB gains (Gray World: drive R_avg and B_avg toward G_avg)
-  if (awb_count > 100) {
-    int avg_r = (int)(sum_r / awb_count);
-    int avg_g = (int)(sum_g / awb_count);
-    int avg_b = (int)(sum_b / awb_count);
-    if (avg_r > 0 && avg_g > 0 && avg_b > 0) {
-      int new_r = (avg_g * 100) / avg_r;   // gain to lift R to match G
-      int new_b = (avg_g * 100) / avg_b;   // gain to lift B to match G
-      // Clamp to [50, 300]  (×0.5 … ×3.0) — avoids wild swings
-      if (new_r <  50) new_r =  50;  if (new_r > 300) new_r = 300;
-      if (new_b <  50) new_b =  50;  if (new_b > 300) new_b = 300;
-      // IIR smooth: 80 % old + 20 % new → gradual adaptation
-      s_wb_red  = (uint16_t)(((int)s_wb_red  * 8 + new_r * 2) / 10);
-      s_wb_blue = (uint16_t)(((int)s_wb_blue * 8 + new_b * 2) / 10);
-    }
   }
 
   // ---- Step 2: 5×5 box blur → contrast stretch → binary mask ----
