@@ -735,89 +735,6 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     bg_u8[i]  = (uint8_t)((diff + 255) / 2);
   }
 
-<<<<<<< Updated upstream
-  // Determine the actual capture resolution from the library.
-  // The Arduino IMX219 library now provides a full-frame downsampled
-  // grayscale buffer (no ROI crop).  We infer the source size from the
-  // byte count and apply software crop matching the Python training pipeline.
-  int src_side = 1;
-  while (src_side * src_side < (int)gray_size) src_side++;
-
-  if (!s_gray_size_logged) {
-    s_gray_size_logged = true;
-    TFLITE_CAM_LOGI("gray buffer: %u bytes (%dx%d src), out=%dx%d crop_mode=%d",
-                    (unsigned)gray_size, src_side, src_side, OUT_WIDTH, OUT_HEIGHT, s_crop_mode);
-    TFLITE_CAM_LOGI("Arduino IMX219 library: full-frame downsize; software crop applied here.");
-  }
-
-  // Helper: crop + nearest-neighbor resize from src_side×src_side → OUT_WIDTH×OUT_HEIGHT.
-  // Crop region matches the Python training pipeline (image_preprocess.py).
-  int crop_x1, crop_y1, crop_x2, crop_y2;
-  if (s_crop_mode == CROP_MODE_JUNCTION) {
-    // Junction mode: lower 40%-75% of height, full width (matches Python _junction_bbox).
-    crop_x1 = 0;
-    crop_x2 = src_side;
-    crop_y1 = (int)(src_side * 0.40f);
-    crop_y2 = (int)(src_side * 0.75f);
-  } else {
-    // Sign mode (default): upper-left search window (matches Python _sign_search_window).
-    // Search window: left 4%-50% width, top 14%-62% height.
-    crop_x1 = (int)(src_side * 0.04f);
-    crop_x2 = (int)(src_side * 0.50f);
-    crop_y1 = (int)(src_side * 0.14f);
-    crop_y2 = (int)(src_side * 0.62f);
-  }
-  int crop_w = crop_x2 - crop_x1;
-  int crop_h = crop_y2 - crop_y1;
-  if (crop_w < 1) crop_w = 1;
-  if (crop_h < 1) crop_h = 1;
-
-  // Fill output with black (int8 minimum = -128) first, so any region not
-  // covered by the crop render stays black (matching Python ImageOps.pad).
-  memset(image_data, -128, OUT_WIDTH * OUT_HEIGHT);
-
-  if (s_crop_mode == CROP_MODE_JUNCTION) {
-    // Junction mode: preserve aspect ratio + pad with black bars.
-    // Matches Python _render_crop with preserve_aspect=True (ImageOps.pad).
-    // The crop is typically wider than tall (e.g. full width × 35% height),
-    // so we fit by width and center vertically.
-    int scaled_h = crop_h * OUT_WIDTH / crop_w;
-    if (scaled_h > OUT_HEIGHT) {
-      // Crop is taller than output — fit by height instead.
-      int scaled_w = crop_w * OUT_HEIGHT / crop_h;
-      int off_x = (OUT_WIDTH - scaled_w) / 2;
-      for (int y = 0; y < OUT_HEIGHT; y++) {
-        int src_y = crop_y1 + y * crop_h / OUT_HEIGHT;
-        if (src_y >= src_side) src_y = src_side - 1;
-        for (int x = 0; x < scaled_w; x++) {
-          int src_x = crop_x1 + x * crop_w / scaled_w;
-          if (src_x >= src_side) src_x = src_side - 1;
-          image_data[y * OUT_WIDTH + off_x + x] = (int8_t)((int)gray_u8[src_y * src_side + src_x] - 128);
-        }
-      }
-    } else {
-      // Fit by width, center vertically.
-      int off_y = (OUT_HEIGHT - scaled_h) / 2;
-      for (int y = 0; y < scaled_h; y++) {
-        int src_y = crop_y1 + y * crop_h / scaled_h;
-        if (src_y >= src_side) src_y = src_side - 1;
-        for (int x = 0; x < OUT_WIDTH; x++) {
-          int src_x = crop_x1 + x * crop_w / OUT_WIDTH;
-          if (src_x >= src_side) src_x = src_side - 1;
-          image_data[(off_y + y) * OUT_WIDTH + x] = (int8_t)((int)gray_u8[src_y * src_side + src_x] - 128);
-        }
-      }
-    }
-  } else {
-    // Sign mode: stretch to fill (matching Python preserve_aspect=False).
-    for (int y = 0; y < OUT_HEIGHT; y++) {
-      int src_y = crop_y1 + y * crop_h / OUT_HEIGHT;
-      if (src_y >= src_side) src_y = src_side - 1;
-      for (int x = 0; x < OUT_WIDTH; x++) {
-        int src_x = crop_x1 + x * crop_w / OUT_WIDTH;
-        if (src_x >= src_side) src_x = src_side - 1;
-        image_data[y * OUT_WIDTH + x] = (int8_t)((int)gray_u8[src_y * src_side + src_x] - 128);
-=======
   // ---- Step 2: 5×5 box blur → contrast stretch → binary mask ----
   static int16_t bg_blur[OUT_WIDTH * OUT_HEIGHT];
   int16_t bg_min = 32767, bg_max = -32768;
@@ -1020,7 +937,6 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
         uint8_t v = (uint8_t)((int)image_data[i] + 128);
         int stretched = ((int)v - (int)min_val) * 255 / span;
         image_data[i] = (int8_t)(stretched - 128);
->>>>>>> Stashed changes
       }
     }
   }
