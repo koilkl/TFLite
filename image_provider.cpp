@@ -716,11 +716,6 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   static constexpr uint16_t kTfWbBlue = 200;
   const uint8_t *rgb = esp32_p4_imx219_rgb_wb(kTfWbRed, kTfWbBlue);
 
-  // ---- Step 0: get WB-corrected RGB from library ----
-  // Gains must match AItraining/image_preprocess.py and the example sketch.
-  static constexpr uint16_t kTfWbRed  = 200;  // ×2.0
-  static constexpr uint16_t kTfWbBlue = 200;
-  const uint8_t *rgb = esp32_p4_imx219_rgb_wb(kTfWbRed, kTfWbBlue);
   // (no need to check rgb_size — rgb_wb always returns a valid pointer)
 
   // ---- Step 1: B-G extraction → raw grayscale ----
