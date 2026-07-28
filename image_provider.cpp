@@ -712,25 +712,61 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   //
   // This pipeline runs IDENTICALLY in AItraining/image_preprocess.py.
   // Any change here MUST be mirrored there.
-  static constexpr uint16_t kTfWbRed  = 200;  // ×2.0
-  static constexpr uint16_t kTfWbBlue = 200;
-  const uint8_t *rgb = esp32_p4_imx219_rgb_wb(kTfWbRed, kTfWbBlue);
 
-  // (no need to check rgb_size — rgb_wb always returns a valid pointer)
+  // ---- Step 0: Dynamic Auto White Balance (Gray World) ----
+  // Compute per-frame WB gains so colours are consistent regardless of lighting.
+  // Same algorithm as Python image_preprocess.py.
+  const uint8_t *rgb_raw = esp32_p4_imx219_rgb();  // raw sensor, no WB
 
-  // ---- Step 1: B-G extraction → raw grayscale ----
   static int16_t bg_raw[OUT_WIDTH * OUT_HEIGHT];   // signed B-G values
   static uint8_t bg_u8[OUT_WIDTH * OUT_HEIGHT];
+
+  // Pass 1: accumulate channel sums for AWB (skip pure black)
+  int64_t sum_r = 0, sum_g = 0, sum_b = 0;
+  int awb_n = 0;
   for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-    int r = rgb[i * 3 + 0];
-    int g = rgb[i * 3 + 1];
-    int b = rgb[i * 3 + 2];
+    int rr = rgb_raw[i * 3 + 0];
+    int gg = rgb_raw[i * 3 + 1];
+    int bb = rgb_raw[i * 3 + 2];
+    if (rr < 10 && gg < 10 && bb < 10) continue;  // skip pure black
+    sum_r += rr;  sum_g += gg;  sum_b += bb;
+    awb_n++;
+  }
+
+  // Compute Gray World gains: scale R and B to match G average
+  uint16_t wb_r = 200, wb_b = 200;  // default ×2.0
+  if (awb_n > 100) {
+    int avg_r = (int)(sum_r / awb_n);
+    int avg_g = (int)(sum_g / awb_n);
+    int avg_b = (int)(sum_b / awb_n);
+    if (avg_r > 0 && avg_g > 0 && avg_b > 0) {
+      int gr = (avg_g * 100) / avg_r;  // gain ×100
+      int gb = (avg_g * 100) / avg_b;
+      if (gr <  50) gr =  50;  if (gr > 400) gr = 400;  // clamp [0.5, 4.0]
+      if (gb <  50) gb =  50;  if (gb > 400) gb = 400;
+      wb_r = (uint16_t)gr;
+      wb_b = (uint16_t)gb;
+    }
+  }
+
+  // ---- Step 1: B-G extraction with dynamic WB applied ----
+  for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+    int r_raw = rgb_raw[i * 3 + 0];
+    int g_raw = rgb_raw[i * 3 + 1];
+    int b_raw = rgb_raw[i * 3 + 2];
+
+    // Apply dynamic WB gains
+    int r = (r_raw * (int)wb_r) / 100;
+    int b = (b_raw * (int)wb_b) / 100;
+    int g = g_raw;  // green is reference
+    if (r > 255) r = 255;
+    if (b > 255) b = 255;
+
     // Pure-black areas (shadows) can't be a sign.
-    // Push their B-G to neutral so they don't interfere with stretch / threshold.
     if (r < 10 && g < 10 && b < 10) {
       bg_raw[i] = 0;  bg_u8[i] = 128;  continue;
     }
-    int diff = b - g;  // WB already applied by rgb_wb()
+    int diff = b - g;
     bg_raw[i] = (int16_t)diff;
     bg_u8[i]  = (uint8_t)((diff + 255) / 2);
   }
