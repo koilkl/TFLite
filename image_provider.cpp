@@ -372,12 +372,12 @@ static void init_demosaic_luts(int width, int height, int crop_mode) {
         y_offset = (int)(height * junction_top_frac);
     } else {
         // Sign mode: ROI-based crop matching Python _sign_search_window
-        // Search window: left 4%-50% width, top 14%-62% height
-        // This focuses on the upper-left portion where traffic signs appear.
-        const float sign_search_left_frac  = 0.04f;
-        const float sign_search_right_frac = 0.50f;
-        const float sign_search_top_frac    = 0.14f;
-        const float sign_search_bottom_frac = 0.62f;
+        // Search window: vertical center bar x:35-65%, y:20-80%
+        // Matches Python: _SEARCH_LEFT=0.35 _SEARCH_RIGHT=0.65 _SEARCH_TOP=0.20 _SEARCH_BOTTOM=0.80
+        const float sign_search_left_frac   = 0.35f;
+        const float sign_search_right_frac  = 0.65f;
+        const float sign_search_top_frac    = 0.20f;
+        const float sign_search_bottom_frac = 0.80f;
 
         int search_left   = (int)(width  * sign_search_left_frac);
         int search_right  = (int)(width  * sign_search_right_frac);
