@@ -915,13 +915,21 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     }
   }
 
-  // ---- Step 4: resize crop (or full frame) → 96×96 ----
+  // ---- Step 4: crop from original AWB'd RGB + BT.601 luminance ----
+  // ROI detection used B-G for blob search, but the final pixels come
+  // from the unmodified AWB-corrected source — much sharper for black signs.
   if (!found_roi) {
-    // No purple region found → use full frame
-    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++)
-      image_data[i] = (int8_t)((int)bg_u8[i] - 128);
+    // No sign found → full-frame BT.601 luminance from original RGB
+    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+      int idx3 = i * 3;
+      uint8_t r = rgb_raw[idx3 + 0];
+      uint8_t g = rgb_raw[idx3 + 1];
+      uint8_t b = rgb_raw[idx3 + 2];
+      uint8_t lum = (uint8_t)(((uint16_t)r * 30 + (uint16_t)g * 59 + (uint16_t)b * 11) / 100);
+      image_data[i] = (int8_t)((int)lum - 128);
+    }
   } else {
-    // ---- Step 5: nearest-neighbour resize crop → 96×96 ----
+    // ---- Step 5: nearest-neighbour resize crop from original RGB ----
     // crop_x1/y1/w/h already set by blob detection above
     for (int y = 0; y < OUT_HEIGHT; y++) {
       int src_y = crop_y1 + y * crop_h / OUT_HEIGHT;
@@ -929,7 +937,12 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
       for (int x = 0; x < OUT_WIDTH; x++) {
         int src_x = crop_x1 + x * crop_w / OUT_WIDTH;
         if (src_x >= OUT_WIDTH) src_x = OUT_WIDTH - 1;
-        image_data[y * OUT_WIDTH + x] = (int8_t)((int)bg_u8[src_y * OUT_WIDTH + src_x] - 128);
+        int idx3 = (src_y * OUT_WIDTH + src_x) * 3;
+        uint8_t r = rgb_raw[idx3 + 0];
+        uint8_t g = rgb_raw[idx3 + 1];
+        uint8_t b = rgb_raw[idx3 + 2];
+        uint8_t lum = (uint8_t)(((uint16_t)r * 30 + (uint16_t)g * 59 + (uint16_t)b * 11) / 100);
+        image_data[y * OUT_WIDTH + x] = (int8_t)((int)lum - 128);
       }
     }
   }
