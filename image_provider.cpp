@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,19 +57,28 @@
 #endif
 
 #if defined(ARDUINO_ARCH_ESP32P4)
-#include <ESP32_P4_IMX219.h>
-#define TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB 1
-#elif __has_include("ESP32_P4_IMX219.h")
-#include "ESP32_P4_IMX219.h"
-#define TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB 1
-#elif __has_include(<ESP32_P4_IMX219.h>)
-#include <ESP32_P4_IMX219.h>
-#define TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB 1
+#define TFLITE_P4_HAS_ARDUINO_CAM_LIB 1
 #else
-#define TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB 0
+#define TFLITE_P4_HAS_ARDUINO_CAM_LIB 0
 #endif
 
-#if !TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB && __has_include("esp_video_init.h")
+#if TFLITE_P4_HAS_ARDUINO_CAM_LIB
+#define TFLITE_HAS_IMX219 (CAMERA_TYPE == CAMERA_TYPE_IMX219 || CAMERA_TYPE == CAMERA_TYPE_AUTO)
+#define TFLITE_HAS_OV5647 (CAMERA_TYPE == CAMERA_TYPE_OV5647 || CAMERA_TYPE == CAMERA_TYPE_AUTO)
+#if TFLITE_HAS_IMX219
+#include <ESP32_P4_IMX219.h>
+#endif
+#if TFLITE_HAS_OV5647
+#include <ESP32_P4_OV5647.h>
+#endif
+#if !TFLITE_HAS_IMX219 && !TFLITE_HAS_OV5647
+#error "CAMERA_TYPE must be CAMERA_TYPE_IMX219, CAMERA_TYPE_OV5647 or CAMERA_TYPE_AUTO"
+#endif
+#endif
+
+#define TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB TFLITE_P4_HAS_ARDUINO_CAM_LIB
+
+#if !TFLITE_P4_HAS_ARDUINO_CAM_LIB && __has_include("esp_video_init.h")
 #ifdef CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE
 #undef CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE
 #endif
@@ -78,17 +88,173 @@
 #include "esp_video_device.h"
 #endif
 
+// ── Camera wrapper: thin veneer over both library APIs ────────────────
+// Both libraries have identical function signatures, only the prefix differs.
+// In AUTO mode the active camera is resolved at runtime by I2C probing.
+#if TFLITE_P4_HAS_ARDUINO_CAM_LIB
 
-volatile int s_crop_mode=CROP_MODE_JUNCTION;
-static int s_last_lut_mode = -1;
+static int s_active_camera = CAMERA_TYPE;
 
-void SetCropMode(int mode) {
-    if (mode == CROP_MODE_JUNCTION || mode == CROP_MODE_SIGN) {
-        s_crop_mode = mode;
-        // Kept for backward compat; the ESP32_P4_IMX219 library no longer reads this.
-        g_imx219_crop_mode = mode;
-    }
+#if CAMERA_TYPE == CAMERA_TYPE_AUTO
+
+// Both sensors share one I2C bus (SCL=26, SDA=27, port 0).  IMX219 sits at
+// 7-bit address 0x10, OV5647 at 0x36.
+#include "driver/i2c_master.h"
+
+static bool cam_i2c_probe(uint8_t addr7) {
+  i2c_master_bus_config_t bcfg = {};
+  bcfg.i2c_port = 0;
+  bcfg.sda_io_num = GPIO_NUM_27;
+  bcfg.scl_io_num = GPIO_NUM_26;
+  bcfg.clk_source = I2C_CLK_SRC_DEFAULT;
+  bcfg.glitch_ignore_cnt = 7;
+  bcfg.flags.enable_internal_pullup = true;
+  i2c_master_bus_handle_t bus = NULL;
+  if (i2c_new_master_bus(&bcfg, &bus) != ESP_OK) return false;
+  bool found = (i2c_master_probe(bus, addr7, 100) == ESP_OK);
+  i2c_del_master_bus(bus);
+  return found;
 }
+
+static void cam_xclk_temporary(uint32_t freq_hz) {
+  // Some sensors only answer I2C once XCLK is running.  Start a temporary
+  // LEDC clock on the shared XCLK pin; CameraBegin re-initialises it.
+  ledc_timer_config_t t = {};
+  t.speed_mode = LEDC_LOW_SPEED_MODE;
+  t.timer_num = LEDC_TIMER_0;
+  t.duty_resolution = LEDC_TIMER_1_BIT;
+  t.freq_hz = freq_hz;
+  t.clk_cfg = LEDC_AUTO_CLK;
+  ledc_timer_config(&t);
+  ledc_channel_config_t c = {};
+  c.channel = LEDC_CHANNEL_0;
+  c.duty = 1;
+  c.gpio_num = GPIO_NUM_20;
+  c.speed_mode = LEDC_LOW_SPEED_MODE;
+  c.timer_sel = LEDC_TIMER_0;
+  ledc_channel_config(&c);
+}
+
+static int detect_camera_type() {
+  // Try a plain I2C probe first.
+  if (cam_i2c_probe(0x10)) return CAMERA_TYPE_IMX219;
+  if (cam_i2c_probe(0x36)) return CAMERA_TYPE_OV5647;
+
+  // Retry with XCLK running (required by some sensors for I2C).
+  cam_xclk_temporary(24000000);
+  delay(10);
+  int found = 0;
+  if (cam_i2c_probe(0x10)) found = CAMERA_TYPE_IMX219;
+  else if (cam_i2c_probe(0x36)) found = CAMERA_TYPE_OV5647;
+  ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+  return found;
+}
+#endif  // CAMERA_TYPE == AUTO
+
+bool CameraBegin() {
+#if CAMERA_TYPE == CAMERA_TYPE_AUTO
+  s_active_camera = detect_camera_type();
+#endif
+  if (s_active_camera == CAMERA_TYPE_IMX219) {
+#if TFLITE_HAS_IMX219
+    return esp32_p4_imx219_begin();
+#endif
+  }
+  if (s_active_camera == CAMERA_TYPE_OV5647) {
+#if TFLITE_HAS_OV5647
+    return esp32_p4_ov5647_begin();
+#endif
+  }
+  return false;
+}
+
+bool CameraUpdate() {
+  if (s_active_camera == CAMERA_TYPE_IMX219) {
+#if TFLITE_HAS_IMX219
+    return esp32_p4_imx219_update();
+#endif
+  }
+#if TFLITE_HAS_OV5647
+  return esp32_p4_ov5647_update();
+#endif
+  return false;
+}
+
+const uint8_t* CameraGetRgb() {
+  if (s_active_camera == CAMERA_TYPE_IMX219) {
+#if TFLITE_HAS_IMX219
+    return esp32_p4_imx219_rgb();
+#endif
+  }
+#if TFLITE_HAS_OV5647
+  return esp32_p4_ov5647_rgb();
+#endif
+  return nullptr;
+}
+
+size_t CameraGetRgbSize() {
+  if (s_active_camera == CAMERA_TYPE_IMX219) {
+#if TFLITE_HAS_IMX219
+    return esp32_p4_imx219_rgb_size();
+#endif
+  }
+#if TFLITE_HAS_OV5647
+  return esp32_p4_ov5647_rgb_size();
+#endif
+  return 0;
+}
+
+int CameraGetRgbWidth() {
+  size_t sz = CameraGetRgbSize();
+  // Square output: width = sqrt(sz / 3)
+  int w = (int)sqrtf((float)(sz / 3));
+  return (w > 0) ? w : OUT_WIDTH;
+}
+
+const char* CameraGetName() {
+#if CAMERA_TYPE == CAMERA_TYPE_AUTO
+  if (s_active_camera == CAMERA_TYPE_AUTO) {
+    int t = detect_camera_type();
+    if (t != 0) s_active_camera = t;
+  }
+#endif
+  if (s_active_camera == CAMERA_TYPE_IMX219) return "IMX219";
+  if (s_active_camera == CAMERA_TYPE_OV5647) return "OV5647";
+  return "UNKNOWN";
+}
+
+// Resize library RGB (width src_w) to OUT_WIDTH×OUT_WIDTH×3 with WB gains,
+// nearest-neighbour.  Used by GetImage and the RGB data-collection mode so
+// both cameras always produce the same IMG_SIZE×IMG_SIZE format.
+static void resize_rgb_wb(const uint8_t *src, int src_w, uint8_t *dst,
+                          uint16_t wb_red, uint16_t wb_blue) {
+  for (int y = 0; y < OUT_HEIGHT; y++) {
+    int src_y = (int)((int64_t)y * src_w / OUT_WIDTH);
+    for (int x = 0; x < OUT_WIDTH; x++) {
+      int src_x = (int)((int64_t)x * src_w / OUT_WIDTH);
+      int si = (src_y * src_w + src_x) * 3;
+      int di = (y * OUT_WIDTH + x) * 3;
+      int r = (int)src[si + 0] * wb_red / 100;  if (r > 255) r = 255;
+      int g = (int)src[si + 1];
+      int b = (int)src[si + 2] * wb_blue / 100; if (b > 255) b = 255;
+      dst[di + 0] = (uint8_t)r;
+      dst[di + 1] = (uint8_t)g;
+      dst[di + 2] = (uint8_t)b;
+    }
+  }
+}
+
+void CameraSendRgbToSerialWb(uint16_t wb_red, uint16_t wb_blue) {
+  static uint8_t buf[OUT_WIDTH * OUT_HEIGHT * 3];
+  resize_rgb_wb(CameraGetRgb(), CameraGetRgbWidth(), buf, wb_red, wb_blue);
+  // Data-collection sync header: 0xAA 0x55 0xAA + IMG_SIZE×IMG_SIZE×3
+  const uint8_t sync[3] = {0xAA, 0x55, 0xAA};
+  Serial.write(sync, 3);
+  Serial.write(buf, sizeof(buf));
+}
+#endif  // TFLITE_P4_HAS_ARDUINO_CAM_LIB
+
+static int s_last_lut_mode = -1;
 
 #if !TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB && __has_include("esp_video_init.h")
 #define TFLITE_P4_IMX219_HAS_ESP_VIDEO 1
@@ -351,7 +517,7 @@ static void tflite_cam_free(void *p) {
 #endif
 
 // Initialize lookup tables for demosaicing and cropping
-static void init_demosaic_luts(int width, int height, int crop_mode) {
+static void init_demosaic_luts(int width, int height) {
     if (s_x_lut == NULL) {
         s_x_lut = (int *)malloc(OUT_WIDTH * sizeof(int));
     }
@@ -361,46 +527,34 @@ static void init_demosaic_luts(int width, int height, int crop_mode) {
 
     int crop_w, crop_h, x_offset, y_offset;
 
-    if (crop_mode == CROP_MODE_JUNCTION) {
-        // Junction mode: lower 40%-75% of the image (matches Python _junction_bbox)
-        // For IMG_HEIGHT=1232: y_offset=492, crop_h=432
-        const float junction_top_frac = 0.40f;
-        const float junction_bottom_frac = 0.75f;
-        crop_w = 1232;
-        crop_h = (int)(height * (junction_bottom_frac - junction_top_frac));
-        x_offset = (width - crop_w) / 2;
-        y_offset = (int)(height * junction_top_frac);
-    } else {
-        // Sign mode: ROI-based crop matching Python _sign_search_window
-        // Search window: vertical center bar x:35-65%, y:20-80%
-        // Matches Python: _SEARCH_LEFT=0.35 _SEARCH_RIGHT=0.65 _SEARCH_TOP=0.20 _SEARCH_BOTTOM=0.80
-        const float sign_search_left_frac   = 0.35f;
-        const float sign_search_right_frac  = 0.65f;
-        const float sign_search_top_frac    = 0.20f;
-        const float sign_search_bottom_frac = 0.80f;
+    // Sign ROI: center bar x:35-65%, y:20-80%
+    // Matches Python: _SEARCH_LEFT=0.35 _SEARCH_RIGHT=0.65 _SEARCH_TOP=0.20 _SEARCH_BOTTOM=0.80
+    const float sign_search_left_frac   = 0.35f;
+    const float sign_search_right_frac  = 0.65f;
+    const float sign_search_top_frac    = 0.20f;
+    const float sign_search_bottom_frac = 0.80f;
 
-        int search_left   = (int)(width  * sign_search_left_frac);
-        int search_right  = (int)(width  * sign_search_right_frac);
-        int search_top    = (int)(height * sign_search_top_frac);
-        int search_bottom = (int)(height * sign_search_bottom_frac);
+    int search_left   = (int)(width  * sign_search_left_frac);
+    int search_right  = (int)(width  * sign_search_right_frac);
+    int search_top    = (int)(height * sign_search_top_frac);
+    int search_bottom = (int)(height * sign_search_bottom_frac);
 
-        int search_w = search_right - search_left;
-        int search_h = search_bottom - search_top;
+    int search_w = search_right - search_left;
+    int search_h = search_bottom - search_top;
 
-        // Take the largest square that fits inside the search window.
-        crop_w = (search_w < search_h) ? search_w : search_h;
-        crop_h = crop_w;
+    // Take the largest square that fits inside the search window.
+    crop_w = (search_w < search_h) ? search_w : search_h;
+    crop_h = crop_w;
 
-        // Center the crop within the search window.
-        x_offset = search_left + (search_w - crop_w) / 2;
-        y_offset = search_top  + (search_h - crop_h) / 2;
+    // Center the crop within the search window.
+    x_offset = search_left + (search_w - crop_w) / 2;
+    y_offset = search_top  + (search_h - crop_h) / 2;
 
-        // Clamp to image bounds.
-        if (x_offset < 0) x_offset = 0;
-        if (y_offset < 0) y_offset = 0;
-        if (x_offset + crop_w > width)  x_offset = width  - crop_w;
-        if (y_offset + crop_h > height) y_offset = height - crop_h;
-    }
+    // Clamp to image bounds.
+    if (x_offset < 0) x_offset = 0;
+    if (y_offset < 0) y_offset = 0;
+    if (x_offset + crop_w > width)  x_offset = width  - crop_w;
+    if (y_offset + crop_h > height) y_offset = height - crop_h;
 
     float x_step = (float)crop_w / OUT_WIDTH;
     float y_step = (float)crop_h / OUT_HEIGHT;
@@ -412,13 +566,13 @@ static void init_demosaic_luts(int width, int height, int crop_mode) {
         s_x_lut[x] = (x_offset + (int)(x * x_step + 0.5f)) & ~1;
     }
 
-    s_last_lut_mode = crop_mode;
+    s_last_lut_mode = 0;
 }
 
 // Demosaic BGGR raw 10-bit data to RGB
 static void demosaic_bggr_to_rgb(const uint8_t *raw10, uint8_t *rgb, int width, int height) {
-    if (s_x_lut == NULL || s_y_lut == NULL || s_last_lut_mode != s_crop_mode) {
-        init_demosaic_luts(width, height, s_crop_mode);
+    if (s_x_lut == NULL || s_y_lut == NULL) {
+        init_demosaic_luts(width, height);
     }
 
     int raw_stride = (int)(s_raw_bytesperline > 0 ? s_raw_bytesperline : (uint32_t)(width * 5 / 4));
@@ -501,7 +655,7 @@ static TfLiteStatus camera_init_if_needed(tflite::ErrorReporter* error_reporter)
   }
 
   if (s_x_lut == NULL || s_y_lut == NULL) {
-    init_demosaic_luts(IMG_WIDTH, IMG_HEIGHT, CROP_MODE_SIGN);
+    init_demosaic_luts(IMG_WIDTH, IMG_HEIGHT);
   }
 
 #if __has_include("nvs_flash.h")
@@ -665,6 +819,25 @@ static void camera_deinit(void) {
 
 #endif
 
+// Contrast-stretch an int8 image (value = gray−128) to full [0,255] range.
+// Applied when the span is ≥ 24, matching the B-G pipeline's final step.
+static void contrast_stretch_int8(int8_t *image_data) {
+  uint8_t min_val = 255, max_val = 0;
+  for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+    uint8_t v = (uint8_t)((int)image_data[i] + 128);
+    if (v < min_val) min_val = v;
+    if (v > max_val) max_val = v;
+  }
+  int span = (int)max_val - (int)min_val;
+  if (span >= 24) {
+    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+      uint8_t v = (uint8_t)((int)image_data[i] + 128);
+      int stretched = ((int)v - (int)min_val) * 255 / span;
+      image_data[i] = (int8_t)(stretched - 128);
+    }
+  }
+}
+
 // Public function to get the image
 TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, int image_height, int channels, int8_t* image_data) {
   if (image_width != OUT_WIDTH || image_height != OUT_HEIGHT || channels != 1) {
@@ -674,32 +847,55 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
 
 #if TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB
   static bool s_backend_logged = false;
-  static bool s_gray_size_logged = false;
   if (!s_backend_logged) {
     s_backend_logged = true;
-    TFLITE_CAM_LOGI("GetImage backend: arduino_imx219_lib  (B-G diff mode)");
+    TFLITE_CAM_LOGI("GetImage backend: %s lib (B-G diff mode)", CameraGetName());
   }
   static bool s_ok = false;
   if (!s_ok) {
-    s_ok = esp32_p4_imx219_begin();
+    s_ok = CameraBegin();
     if (!s_ok) {
-      TF_LITE_REPORT_ERROR(error_reporter, "esp32_p4_imx219_begin failed");
+      TF_LITE_REPORT_ERROR(error_reporter, "CameraBegin failed");
       return kTfLiteError;
     }
   }
 
   bool updated = false;
   for (int tries = 0; tries < 100; tries++) {
-    if (esp32_p4_imx219_update()) {
+    if (CameraUpdate()) {
       updated = true;
       break;
     }
     usleep(2000);
   }
   if (!updated) {
-    TF_LITE_REPORT_ERROR(error_reporter, "esp32_p4_imx219_update timeout");
+    TF_LITE_REPORT_ERROR(error_reporter, "CameraUpdate timeout");
     return kTfLiteError;
   }
+
+  const uint8_t *rgb_lib = CameraGetRgb();  // raw sensor, no WB
+  // OV5647 lib outputs at its own IMG_SIZE (160×160); everything below
+  // expects IMG_SIZE×IMG_SIZE×3.  Nearest-neighbour resize (identity for
+  // IMX219).  WB gains 100/100 = passthrough; dynamic AWB happens later
+  // in BG mode.
+  static uint8_t rgb_resized[OUT_WIDTH * OUT_HEIGHT * 3];
+  resize_rgb_wb(rgb_lib, CameraGetRgbWidth(), rgb_resized, 100, 100);
+  const uint8_t *rgb_raw = rgb_resized;
+
+#if PREPROCESS_MODE == PREPROCESS_MODE_GRAY
+  // ── Grayscale mode: plain BT.601 luminance, no B-G / no blob crop ──
+  for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+    int idx3 = i * 3;
+    uint8_t r = rgb_raw[idx3 + 0];
+    uint8_t g = rgb_raw[idx3 + 1];
+    uint8_t b = rgb_raw[idx3 + 2];
+    uint8_t lum = (uint8_t)(((uint16_t)r * 30 + (uint16_t)g * 59 + (uint16_t)b * 11) / 100);
+    image_data[i] = (int8_t)((int)lum - 128);
+  }
+  contrast_stretch_int8(image_data);
+  return kTfLiteOk;
+
+#elif PREPROCESS_MODE == PREPROCESS_MODE_BG
 
   // ── B-G difference pipeline ──
   // Blue / purple signs → high B, low G → B-G is large positive.
@@ -716,7 +912,6 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   // ---- Step 0: Dynamic Auto White Balance (Gray World) ----
   // Compute per-frame WB gains so colours are consistent regardless of lighting.
   // Same algorithm as Python image_preprocess.py.
-  const uint8_t *rgb_raw = esp32_p4_imx219_rgb();  // raw sensor, no WB
 
   static int16_t bg_raw[OUT_WIDTH * OUT_HEIGHT];   // signed B-G values
   static uint8_t bg_u8[OUT_WIDTH * OUT_HEIGHT];
@@ -948,22 +1143,12 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   }
 
   // ---- Step 6: contrast stretch ----
-  {
-    uint8_t min_val = 255, max_val = 0;
-    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-      uint8_t v = (uint8_t)((int)image_data[i] + 128);
-      if (v < min_val) min_val = v;
-      if (v > max_val) max_val = v;
-    }
-    int span = (int)max_val - (int)min_val;
-    if (span >= 24) {
-      for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-        uint8_t v = (uint8_t)((int)image_data[i] + 128);
-        int stretched = ((int)v - (int)min_val) * 255 / span;
-        image_data[i] = (int8_t)(stretched - 128);
-      }
-    }
-  }
+  contrast_stretch_int8(image_data);
+
+#else  // PREPROCESS_MODE == RGB: handled in the sketch (streaming), not here
+  TF_LITE_REPORT_ERROR(error_reporter, "GetImage not used in RGB mode");
+  return kTfLiteError;
+#endif  // PREPROCESS_MODE
 
   return kTfLiteOk;
 #elif TFLITE_P4_IMX219_HAS_ESP_VIDEO

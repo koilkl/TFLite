@@ -69,15 +69,6 @@ const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 
-// State machine for junction/sign detection
-// State 0 = junction mode (road/cross), State 1 = sign mode (sign classes)
-// volatile: written by uart_rx_task (core 0) on RESUME_JUNCTION, read by
-// inference_task (core 1) every frame — prevents the core-1 compiler from
-// caching a stale value in a register.
-static volatile int s_detection_state = 0;
-static volatile int s_no_sign_frames = 0;
-static constexpr int kNoSignThreshold = 10;
-
 // Bi-directional control: S3 can request P4 to stop/start UART transmission.
 // Inference continues regardless; only the TX path is gated.
 static volatile bool s_transmit_enabled = true;
@@ -85,7 +76,7 @@ static volatile bool s_transmit_enabled = true;
 // RX diagnostics: count bytes and control packets received from S3.
 static volatile uint32_t s_rx_bytes = 0;
 static volatile uint32_t s_rx_ack_stop = 0;
-static volatile uint32_t s_rx_resume_junction = 0;
+static volatile uint32_t s_rx_resume = 0;
 
 static void uart_control_enable() {
   s_transmit_enabled = true;
@@ -113,8 +104,8 @@ static constexpr uint8_t kMsgTypeInference = 0x01;
 static constexpr uint8_t kMsgTypeControl   = 0x02;  // S3 → P4 control messages
 
 // S3 → P4 control commands
-static constexpr uint8_t kCtrlAckStop        = 0x01;  // S3 confirmed sign → stop TX
-static constexpr uint8_t kCtrlResumeJunction = 0x02;  // S3 done → resume TX + junction mode
+static constexpr uint8_t kCtrlAckStop = 0x01;  // S3 confirmed sign → stop TX
+static constexpr uint8_t kCtrlResume  = 0x02;  // S3 done → resume TX
 
 static constexpr uint32_t kUartTxTaskStackBytes = 4 * 1024;
 static constexpr uint32_t kUartRxTaskStackBytes = 4 * 1024;
@@ -141,7 +132,6 @@ enum class StorageBackend : uint8_t { Auto = 0, SdMmc = 1, FFat = 2 };
 static constexpr StorageBackend kStorageBackend = StorageBackend::SdMmc;
 static constexpr bool kFormatFfatOnFail = true;
 
-// extern volatile int s_crop_mode;
 #ifndef BOARD_SDMMC_POWER_PIN
 #define BOARD_SDMMC_POWER_PIN 45
 #endif
@@ -443,12 +433,10 @@ static void uart_rx_task(void *arg) {
         Serial.printf("UART RX: ACK_STOP from S3 (#%lu) — disabling TX\n",
                       (unsigned long)s_rx_ack_stop);
         uart_control_disable();
-      } else if (cmd == kCtrlResumeJunction) {
-        s_rx_resume_junction++;
-        Serial.printf("UART RX: RESUME_JUNCTION from S3 (#%lu) — resuming TX + junction mode\n",
-                      (unsigned long)s_rx_resume_junction);
-        s_detection_state = 0;
-        s_no_sign_frames = 0;
+      } else if (cmd == kCtrlResume) {
+        s_rx_resume++;
+        Serial.printf("UART RX: RESUME from S3 (#%lu) — resuming TX\n",
+                      (unsigned long)s_rx_resume);
         uart_control_enable();
       } else {
         Serial.printf("UART RX: unknown control cmd 0x%02X\n", cmd);
@@ -461,14 +449,14 @@ static void uart_rx_task(void *arg) {
       last_rx_log_ms = now;
       Serial.printf("UART RX: bytes=%lu ack_stop=%lu resume=%lu tx_enabled=%d\n",
                     (unsigned long)s_rx_bytes, (unsigned long)s_rx_ack_stop,
-                    (unsigned long)s_rx_resume_junction, (int)s_transmit_enabled);
+                    (unsigned long)s_rx_resume, (int)s_transmit_enabled);
     }
 
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
-static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, uint8_t *confidence, int detection_state) {
+static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, uint8_t *confidence) {
   uint8_t best_label = 0;
   int best_score = 0;
 
@@ -480,14 +468,6 @@ static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, u
       score = (int)output->data.uint8[i];
     } else if (output->type == kTfLiteFloat32) {
       score = (int)(output->data.f[i] * 255.0f);
-    }
-
-    // Per-class masking: in junction mode (0), only road classes (kClassTypes==1);
-    // in sign mode (1), only sign classes (kClassTypes==0).
-    // Classes not matching the current state have their score zeroed.
-    uint8_t expected_type = (detection_state == 0) ? 1 : 0;
-    if (i < kCategoryCount && kClassTypes[i] != expected_type) {
-      score = 0;
     }
 
     if (score > best_score) {
@@ -513,6 +493,31 @@ static void inference_task(void *arg) {
   uint32_t timed_frames = 0;
 
   for (;;) {
+#if PREPROCESS_MODE == PREPROCESS_MODE_RGB
+    // ── RGB data-collection mode ──
+    // Streams WB-corrected IMG_SIZE×IMG_SIZE×3 RGB to Serial with the same
+    // protocol as the IMX219_RGB_Serial example (0xAA 0x55 0xAA + payload).
+    // No inference, no UART to S3.  Feed the serial port to AItraining.
+    static bool s_stream_ready = false;
+    if (!s_stream_ready) {
+      s_stream_ready = CameraBegin();
+      if (!s_stream_ready) {
+        Serial.println("CameraBegin failed");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+      Serial.printf("RGB stream mode: 0xAA 0x55 0xAA + %dx%dx3\n", IMG_SIZE, IMG_SIZE);
+    }
+    for (int tries = 0; tries < 100; tries++) {
+      if (CameraUpdate()) {
+        CameraSendRgbToSerialWb(200, 200);  // fixed ×2.0 WB, matches AItraining
+        break;
+      }
+      delayMicroseconds(2000);
+    }
+    taskYIELD();
+    continue;
+#else
     if (!input || !interpreter) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
@@ -520,14 +525,12 @@ static void inference_task(void *arg) {
 
     uint64_t t_loop_start = esp_timer_get_time();
 
-    // Set crop mode based on current detection state
-    SetCropMode(s_detection_state == 0 ? CROP_MODE_JUNCTION : CROP_MODE_SIGN);
-
     uint64_t t_capture_start = esp_timer_get_time();
     if (kTfLiteOk != GetImage(error_reporter, OUT_WIDTH, OUT_HEIGHT, kNumChannels, input->data.int8)) {
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
     }
+#endif  // PREPROCESS_MODE == RGB
     uint64_t t_capture_us = esp_timer_get_time() - t_capture_start;
     frame_id++;
 
@@ -548,7 +551,7 @@ static void inference_task(void *arg) {
     TfLiteTensor* output = interpreter->output(0);
     uint8_t label_id = 0;
     uint8_t confidence = 0;
-    pick_label_and_confidence(output, &label_id, &confidence, s_detection_state);
+    pick_label_and_confidence(output, &label_id, &confidence);
 
     // Debug: print raw output values for first 10 frames to diagnose model output
     if (frame_id <= 10) {
@@ -561,31 +564,10 @@ static void inference_task(void *arg) {
         Serial.print(raw_score);
         if (ri < kCategoryCount - 1) Serial.print(",");
       }
-      Serial.print("] st=");
-      Serial.print(s_detection_state);
-      Serial.print(" best=");
+      Serial.print("] best=");
       Serial.print(label_id);
       Serial.print(":");
       Serial.println(confidence);
-    }
-
-    // State machine: junction <-> sign detection
-    if (s_detection_state == 0) {
-      // Junction mode: if a "road" class is detected with confidence, switch to sign mode
-      if (label_id < kCategoryCount && kClassTypes[label_id] == 1 && confidence > 32) {
-        s_detection_state = 1;
-        s_no_sign_frames = 0;
-      }
-    } else {
-      // Sign mode: if a "sign" class is detected with confidence, stay; otherwise count down
-      if (label_id < kCategoryCount && kClassTypes[label_id] == 0 && confidence > 32) {
-        s_no_sign_frames = 0;
-      } else {
-        s_no_sign_frames++;
-        if (s_no_sign_frames >= kNoSignThreshold) {
-          s_detection_state = 0;  // Switch back to junction mode
-        }
-      }
     }
 
     if (kEnableSdLogger && s_sd_queue && !s_sd_full && (frame_id % kSaveEveryNFrames) == 0) {
@@ -609,7 +591,7 @@ static void inference_task(void *arg) {
       pkt.frame_id = frame_id;
       pkt.label_id = label_id;
       pkt.confidence = confidence;
-      pkt.flags = (uint8_t)(s_detection_state + 1);  // 1=junction_ready, 2=sign_ready
+      pkt.flags = 2;  // sign_ready (junction mode removed)
       xQueueOverwrite(s_uart_queue, &pkt);
     }
 
@@ -631,13 +613,6 @@ static void inference_task(void *arg) {
       Serial.print(avg_loop / 1000);
       Serial.print("ms fps≈");
       Serial.print(avg_loop > 0 ? 1000000UL / avg_loop : 0);
-      Serial.print("Chop mode:");
-//    #define CROP_MODE_SIGN     0
-//    #define CROP_MODE_JUNCTION 1
-      if(s_crop_mode==CROP_MODE_JUNCTION)
-      Serial.print("JUN");
-      else
-       Serial.print("SIGN");
       Serial.print(" tx=");
       Serial.print(s_transmit_enabled ? "ON" : "OFF");
       Serial.print(" rx_bytes=");
@@ -670,6 +645,13 @@ void setup() {
   Serial.begin(kDebugBaud);
   delay(100);
   Serial.println("P4 TFLite start");
+#if PREPROCESS_MODE == PREPROCESS_MODE_BG
+  Serial.printf("Preprocess: B-G  | Camera: %s\n", CameraGetName());
+#elif PREPROCESS_MODE == PREPROCESS_MODE_GRAY
+  Serial.printf("Preprocess: GRAY (BT.601)  | Camera: %s\n", CameraGetName());
+#elif PREPROCESS_MODE == PREPROCESS_MODE_RGB
+  Serial.printf("Preprocess: RGB stream (data collection)  | Camera: %s\n", CameraGetName());
+#endif
 
   pinMode(kHandshakePwmPin, OUTPUT);
   analogWrite(kHandshakePwmPin, kHandshakePwmDuty);
