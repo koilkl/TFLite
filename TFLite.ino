@@ -147,6 +147,7 @@ enum class OpMode : uint8_t {
   kInference = 0,   // default: full pipeline → UART / SD / periodic log
   kCaptureRgb= 1,   // PLAIN: AA 55 AA + 96×96×3 RGB, AItraining capture panel 能用
   kCaptureGray= 2,  // PLAIN: AA 55 AA + 96×96×1 GRAY, AItraining 预览/采集 能用
+  kInferGray  = 3,  // infer + stream GRAY on Serial (S3 UART still active), no logs
   kExtCaptureRgb =11,// EXTENDED: AA 55 AB + kind/fid/w/h + pixels + xor（脚本工具用）
   kExtCaptureGray=12 // EXTENDED: 同上 GRAY8
 };
@@ -156,6 +157,7 @@ static const char *op_mode_name(OpMode m) {
     case OpMode::kInference:     return "INFERENCE";
     case OpMode::kCaptureRgb:    return "CAPTURE_RGB/plain(AItraining)";
     case OpMode::kCaptureGray:   return "CAPTURE_GRAY/plain(AItraining)";
+    case OpMode::kInferGray:     return "INFER+GRAY (S3 + gray stream)";
     case OpMode::kExtCaptureRgb: return "CAPTURE_RGB/extended";
     case OpMode::kExtCaptureGray:return "CAPTURE_GRAY/extended";
     default: return "?";
@@ -731,9 +733,10 @@ static void ascii_dispatch(char *line) {
     if      (0==strcmp(tok,"infer")||0==strcmp(tok,"inference")||0==strcmp(tok,"0")) m = OpMode::kInference;
     else if (0==strcmp(tok,"rgb") ||0==strcmp(tok,"1"))                                 m = OpMode::kCaptureRgb;
     else if (0==strcmp(tok,"gray")||0==strcmp(tok,"grey")||0==strcmp(tok,"2"))         m = OpMode::kCaptureGray;
+    else if (0==strcmp(tok,"infergray")||0==strcmp(tok,"infer_gray")||0==strcmp(tok,"3")) m = OpMode::kInferGray;
     else if (0==strcmp(tok,"ext_rgb") ||0==strcmp(tok,"11")) m = OpMode::kExtCaptureRgb;
     else if (0==strcmp(tok,"ext_gray")||0==strcmp(tok,"12")) m = OpMode::kExtCaptureGray;
-    else { Serial.printf("ERR: mode infer|rgb|gray|ext_rgb|ext_gray, got '%s'\r\n", tok); return; }
+    else { Serial.printf("ERR: mode infer|rgb|gray|infergray|ext_rgb|ext_gray, got '%s'\r\n", tok); return; }
     s_op_mode = m;
     Serial.printf("OK  MODE: %s\r\n", op_mode_name(m));
     return;
@@ -852,6 +855,7 @@ static void debug_serial_task(void *arg) {
             case 0:  new_mode = OpMode::kInference;      break;
             case 1:  new_mode = OpMode::kCaptureRgb;     break;
             case 2:  new_mode = OpMode::kCaptureGray;    break;
+            case 3:  new_mode = OpMode::kInferGray;      break;
             case 11: new_mode = OpMode::kExtCaptureRgb;  break;
             case 12: new_mode = OpMode::kExtCaptureGray; break;
             default: handled = false; debug_send_error(cmd, "bad mode"); continue;
@@ -1013,6 +1017,7 @@ static void inference_task(void *arg) {
   static bool s_caprgb_ready   = false;
   static bool s_caprgb_banner  = false;
   static bool s_capgray_banner = false;
+static bool s_infergray_banner = false;
   static bool s_extrgb_ready   = false;
   static bool s_extrgb_banner  = false;
   static bool s_extgray_banner = false;
@@ -1041,6 +1046,7 @@ static void inference_task(void *arg) {
       s_caprgb_ready   = false;
       s_caprgb_banner  = false;
       s_capgray_banner = false;
+      s_infergray_banner = false;
       s_extrgb_ready   = false;
       s_extrgb_banner  = false;
       s_extgray_banner = false;
@@ -1315,7 +1321,7 @@ static void inference_task(void *arg) {
     }
 
     // Debug: print raw output values for first 10 frames to diagnose model output
-    if (frame_id <= 10 || (frame_id % 30) == 0) {
+    if (mode == OpMode::kInference && (frame_id <= 10 || (frame_id % 30) == 0)) {
       Serial.print("  ood: sign_pct=");
       Serial.print(sign_pct, 1);
       Serial.print("% max_prob=");
@@ -1343,7 +1349,7 @@ static void inference_task(void *arg) {
       Serial.println(")");
     }
 
-    if (mode == OpMode::kInference) {
+    if (mode == OpMode::kInference || mode == OpMode::kInferGray) {
       if (kEnableSdLogger && s_sd_queue && !s_sd_full && (frame_id % kSaveEveryNFrames) == 0) {
         uint8_t *dst = s_sd_buffers[next_sd_buffer];
         for (size_t i = 0; i < kImageBytes; i++) {
@@ -1373,7 +1379,21 @@ static void inference_task(void *arg) {
       }
     }
 
-    if ((frame_id % 1) == 0 && timed_frames > 0) {
+    if (mode == OpMode::kInferGray) {
+      // Stream the model input as GRAY on Serial (same wire format as
+      // kCaptureGray: AA 55 AA + 96×96×1 GRAY8) — no text, so AItraining's
+      // SerialFrameReader can parse it live while the S3 still gets packets.
+      static uint8_t gray[IMG_SIZE * IMG_SIZE];
+      for (size_t i = 0; i < (size_t)IMG_SIZE * (size_t)IMG_SIZE; i++) {
+        gray[i] = (uint8_t)((int)input->data.int8[i] + 128);
+      }
+      static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
+      Serial.write(sync, 3);
+      Serial.write(gray, sizeof(gray));
+      Serial.flush();
+    }
+
+    if (mode == OpMode::kInference && (frame_id % 1) == 0 && timed_frames > 0) {
       uint32_t avg_cap = (uint32_t)(total_capture_us / timed_frames);
       uint32_t avg_inv = (uint32_t)(total_invoke_us / timed_frames);
       uint32_t avg_loop = (uint32_t)(total_loop_us / timed_frames);

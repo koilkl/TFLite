@@ -1,6 +1,6 @@
 # TFLite
 
-On-device sign inference for ESP32-P4 with TensorFlow Lite Micro. Captures frames from an IMX219 or OV5647 camera, runs the B-G colour-difference pipeline, classifies the sign, and sends the result to the ESP32-S3 over UART.
+On-device sign inference for ESP32-P4 with TensorFlow Lite Micro. Captures frames from an IMX219 or OV5647 camera, applies the center-60 % crop + BT.601-luminance pipeline that exactly matches the AItraining training cache, classifies the sign, and sends the result to the ESP32-S3 over UART.
 
 Out-of-distribution (OOD) rejection is built in: empty scenes / overexposed frames / no-sign inputs are signalled via the UART/SD `flags` byte so receivers never trust a softmax-hallucinated high-confidence label. See **OOD (No Sign) Signalling** below.
 
@@ -28,25 +28,26 @@ Edit `image_provider.h`:
 
 | Mode | What GetImage produces | Use case |
 |---|---|---|
-| `PREPROCESS_MODE_BG` (default) | B-G colour difference + blob auto-crop + contrast | Sign inference (matches `AItraining/image_preprocess.py`) |
-| `PREPROCESS_MODE_GRAY` | Plain BT.601 grayscale + contrast, no colour difference | Inference on models trained with plain grayscale |
-| `PREPROCESS_MODE_RGB` | No inference — streams WB-corrected IMG_SIZE×IMG_SIZE×3 RGB to Serial (`0xAA 0x55 0xAA` + payload) | Data collection for AItraining, like the `IMX219_RGB_Serial` example |
+| `PREPROCESS_MODE_BG` (default) | Center 60 % crop → BT.601 luminance of raw (no-WB) RGB → bilinear → contrast stretch | Sign inference — bit-matches the AItraining training cache |
+| `PREPROCESS_MODE_GRAY` | Same center crop + luminance + stretch, no colour logic at all | Identical pixels to BG in the default config |
+| `PREPROCESS_MODE_RGB` | No inference — streams WB-corrected IMG_SIZE×IMG_SIZE×3 RGB to Serial (`0xAA 0x55 0xAA` + payload) | Data collection for AItraining purple-sign projects, like the `IMX219_RGB_Serial` example |
 
-For monochrome / non-purple sign datasets (END, NO ENTRY, RIGHT, …) the B-G blob detector never fires reliably — disable it and force the same central-crop geometry as the host trainer:
+The **default configuration already matches the AItraining host** (verified 2026-08-26: 86/86 training frames → 0 label flips vs the training cache):
 
 ```cpp
-#define BG_ENABLE_BLOB_SEARCH 0   // skip B-G blob; always center-crop (matches host fast_mode=True)
-#define BG_ENABLE_AWB         0   // skip Gray-World AWB; host training does no AWB
-#define BG_FALLBACK_CENTER_FRAC 0.60f   // center 60% window — MUST match host _center_bbox frac
+#define BG_ENABLE_BLOB_SEARCH 0        // skip B-G blob; always center-crop (matches host fast_mode=True)
+#define BG_FALLBACK_CENTER_FRAC 0.60f  // center 60% window — MUST match host _center_bbox frac
 ```
 
-If these macros diverge from the AItraining host, ROI geometry drift between training and inference is the #1 cause of "val_acc=1.0 but deployed predictions are garbage".
+`BG_ENABLE_AWB` (Gray-World, default 1) has **no effect on the model input** in the default config — its gains only feed the blob search, which is compiled out. The model input must stay WB-free: the grayscale serial stream AItraining trains on is BT.601 of raw sensor RGB with no white balance.
+
+If the crop geometry or pixel transform diverges from the AItraining host, train/inference drift is the #1 cause of "val_acc=1.0 but deployed predictions are garbage".
 
 ## Pipeline
 
-Camera → dynamic Gray-World AWB → B-G extraction → blur → contrast stretch → blob detection → auto-crop → resize IMG_SIZE×IMG_SIZE → contrast → TFLite int8 inference → (OOD 3-layer gating) → UART to S3 / SD log.
+Camera → (resize to 96×96, WB passthrough) → center 60 % crop [20,77) → BT.601 luminance (30/59/11) → bilinear 96×96 → contrast stretch (span ≥ 24) → int8 gray−128 → TFLite int8 inference → (OOD 3-layer gating) → UART to S3 / SD log.
 
-See the repo-root `CLAUDE.md` for the full 13-step pipeline. Any change to `image_provider.cpp` must be mirrored in `AItraining/image_preprocess.py`.
+Any change to `image_provider.cpp` must be mirrored in `AItraining/image_preprocess.py` (see repo-root `CLAUDE.md` for the canonical 6-step pipeline).
 
 ## OOD (No Sign) Signalling
 
@@ -54,9 +55,11 @@ Softmax always normalises its logits to sum to 1.0, which means it outputs a mis
 
 | Layer | Signal | Tunable macro (default) | Meaning |
 |---|---|---|---|
-| **L1 – pixel prior** | `sign_pct` % of G-channel pixels in `(BG_MASK_DARK_THRESH, BG_MASK_LUM_THRESH)` | `OOD_SIGN_PCT_MIN=1.0`, `OOD_SIGN_PCT_MAX=55.0` | Real signs produce a band of mid-gray G pixels (~2–40 %); too few → empty scene / overexposed; too many → full shadow / lens cap. |
-| **L2 – max prob** | `max(raw_score_i) / Σraw_scores` on the int8 output tensor | `OOD_MAX_PROB_MIN=0.70` | Softmax can be confidently-wrong on OOD; combined with entropy this rejects the worst cases. |
-| **L3 – normalised entropy** | `-Σ p·log(p) / log(N)` where `N = kCategoryCount` | `OOD_ENTROPY_RATIO_MAX=0.65` | 1.0 = perfectly uniform vote (the net is guessing). Sharp decisions score ≤ 0.4. |
+| **L1 – pixel prior** | `sign_pct` % of G-channel pixels in `(BG_MASK_DARK_THRESH, BG_MASK_LUM_THRESH)` | `OOD_SIGN_PCT_MIN=0.3`, `OOD_SIGN_PCT_MAX=70.0` | Real signs produce a band of mid-gray G pixels; too few → empty scene / overexposed; too many → full shadow / lens cap. |
+| **L2 – max prob** | `max(raw_score_i) / Σraw_scores` on the int8 output tensor | `OOD_MAX_PROB_MIN=0.60` | Softmax can be confidently-wrong on OOD; combined with entropy this rejects the worst cases. |
+| **L3 – normalised entropy** | `-Σ p·log(p) / log(N)` where `N = kCategoryCount` | `OOD_ENTROPY_RATIO_MAX=0.70` | 1.0 = perfectly uniform vote (the net is guessing). Sharp decisions score ≤ 0.4. |
+
+The defaults match the AItraining live-predict gates so the device rejects exactly the same frames the host preview rejects.
 
 Master switch: `OOD_ENABLE` (default `1`). Set `=0` to disable gating entirely (debug only — otherwise you get fake high-confidence labels on no-sign inputs).
 
@@ -95,17 +98,9 @@ df["is_no_sign"]   = (df["flags"] & 0xF0) == 0xF0
 
 ### L1 `sign_pct` thresholds (BG_MASK_DARK/LUM)
 
-OOD L1 counts pixels whose G channel falls in `(BG_MASK_DARK_THRESH, BG_MASK_LUM_THRESH)`. Device-side at inference time the class is unknown, so use the **union** (min-dark, max-lum) of every training class's per-class thresholds:
+OOD L1 counts pixels whose G channel falls in `(BG_MASK_DARK_THRESH, BG_MASK_LUM_THRESH)`. The defaults are `dark=0 / lum=100` — exactly the AItraining live-predict mask defaults (`bg_dark_thresh=0`, `bg_lum_thresh=100`). In the default config (blob search off) these thresholds drive **only** the sign_pct OOD gate — they never touch the model-input pixels — so keeping them equal to the host's is what makes device and host reject the same frames.
 
-```cpp
-// Example for the "upper" road-sign project.
-// Per-class host configs: NO ENTRY=(30,80), END=(32,75), RIGHT=(35,85)
-// → union: dark=min(30,32,35)=30, lum=max(80,75,85)=85
-#define BG_MASK_DARK_THRESH  30
-#define BG_MASK_LUM_THRESH   85
-```
-
-The union window is wider than any per-class window, so the device `sign_pct` will be slightly larger than the host-side per-class stat. Compensate by relaxing OOD L1 bounds to `OOD_SIGN_PCT_MIN=0.5` and `OOD_SIGN_PCT_MAX=70.0` for these datasets. L2/L3 are numerically independent of L1 and still do the heavy lifting.
+Per-class thresholds saved in the project (e.g. a class configured with dark=20/lum=80) are used by the host training path and by the host `_focus_bbox` preview, not by the device — do not bake per-class values into the firmware; keep the host defaults unless you consistently run live with modified preview sliders.
 
 ## UART Protocol (P4 ↔ S3, bidirectional)
 
@@ -173,24 +168,25 @@ DEBUG: task up @ 921600 baud — type 'help' for Serial Monitor commands; binary
 |---|---|---|
 | `help` or `?` | 10-line command list + 1 example per command | On-device cheat sheet so students never remember this table |
 | `ping` | `PONG` | Cheap connectivity check before tuning anything |
-| `get mask` | `MASK: dark=35 lum=85` | Read current Dark/Lum (G-channel sign-mask thresholds) |
-| `set mask 30 85` | `OK  MASK: dark=30 lum=85` | Write Dark=30 / Lum=85 — *exactly the Host UI sliders*, auto-clamped so dark < lum, applied on the next GetImage frame |
-| `get ood` | `OOD: sp=0.50..70.00 mp=0.700 er=0.650` | 3-layer OOD thresholds right now: sign_pct% window, min max_prob, max normalised entropy ratio |
-| `set ood 0.2 70.0 0.70 0.65` | `OK  OOD: sp=0.20..70.00 mp=0.700 er=0.650` | Loosen OOD L1 so empty scenes with ~0.3% "sign-like pixels" still count (sunny-day fix) |
+| `get mask` | `MASK: dark=0 lum=100` | Read current Dark/Lum (G-channel sign-mask thresholds) |
+| `set mask 0 100` | `OK  MASK: dark=0 lum=100` | Write Dark/Lum — *exactly the Host UI sliders*, auto-clamped so dark < lum, applied on the next GetImage frame |
+| `get ood` | `OOD: sp=0.30..70.00 mp=0.600 er=0.700` | 3-layer OOD thresholds right now: sign_pct% window, min max_prob, max normalised entropy ratio |
+| `set ood 0.3 70.0 0.60 0.70` | `OK  OOD: sp=0.30..70.00 mp=0.600 er=0.700` | Set the host-aligned OOD defaults (empty scenes with <0.3% "sign-like pixels" still count) |
 | `get mode` | `MODE: inference` | Print current OpMode |
 | `mode infer` | `OK  MODE: inference` | Back to normal: run inference, queue UART→S3, write every N-th frame to SD |
 | `mode rgb` | `OK  MODE: capture_rgb` | **Pause inference + UART + SD**.  Instead the device streams RAW RGB24 96×96 sensor frames on Debug Serial (use Style B Python parser to save PNGs offline) |
 | `mode gray` | `OK  MODE: capture_gray` | **Same pause**, but stream the *preprocessed GRAY8 96×96* frame (= exactly what the TFLite input tensor receives).  Every 30th frame also logs `sign_pct` so you can tune Dark/Lum by the numbers. |
+| `mode infergray` | `OK  MODE: infer+gray` | **Inference keeps running** (UART→S3 still active, logs muted) **and** the model-input GRAY8 96×96 frame streams on Serial as `AA 55 AA + payload` — AItraining can parse it live while the S3 still gets packets. Best tool for comparing device input vs host preview. |
 | (typo) `mask 30 85` | `ERR: unknown command 'mask', type 'help'` | Student-friendly "tell them where to look" error messages instead of silent fail |
-| (typo) `set mask foo` | `ERR: set mask <D> <L>, e.g. set mask 30 85` | Inline example printed right on the error line |
-| (typo) `mode neon` | `ERR: mode infer\|rgb\|gray, got 'neon'` | Always prints the valid keyword enum |
+| (typo) `set mask foo` | `ERR: set mask <D> <L>, e.g. set mask 0 100` | Inline example printed right on the error line |
+| (typo) `mode neon` | `ERR: mode infer\|rgb\|gray\|infergray, got 'neon'` | Always prints the valid keyword enum |
 
 **Classroom session recipe (5 minute warm-up):**
 ```
 1. Plug in, open Serial Monitor → 921600 / Both NL & CR
 2. type  ping                       ← see PONG → connection works
 3. type  get mask                   ← remember the current values in case you mess up
-4. type  set mask 28 88             ← widen the sign-mask window for the lab's lighting
+4. type  set mask 0 100             ← host-aligned sign-mask window (default)
 5. type  mode gray                  ← the inference logs stop, CAPTURE_GRAY frames stream
 6. (hold up END sign in front of cam)
 7. (on host Python) save 5 frames as PNG → compare side-by-side with training images
@@ -230,7 +226,7 @@ Every frame on Debug Serial is laid out exactly the same on TX (host→P4, comma
 | `0x02` | `GET_OOD_THRESHOLDS` | **0** | — | 16 bytes, same layout as SET |
 | `0x03` | `SET_MASK_THRESHOLDS` | **2** | `dark uint8`, `lum uint8` (G-channel sign mask Dark/Lum sliders from AItraining) | 0 bytes (ack); applied next GetImage via `ImageProviderSetMaskThresholds` which auto-clamps dark < lum |
 | `0x04` | `GET_MASK_THRESHOLDS` | **0** | — | 2 bytes: `[dark, lum]` |
-| `0x05` | `SET_MODE` | **1** | `mode uint8`: `0`=INFERENCE, `1`=CAPTURE_RGB, `2`=CAPTURE_GRAY | 0 bytes (ack); mode takes effect at the start of the next inference-task loop iteration |
+| `0x05` | `SET_MODE` | **1** | `mode uint8`: `0`=INFERENCE, `1`=CAPTURE_RGB, `2`=CAPTURE_GRAY, `3`=INFER_GRAY (inference + model-input GRAY stream) | 0 bytes (ack); mode takes effect at the start of the next inference-task loop iteration |
 | `0x06` | `GET_MODE` | **0** | — | 1 byte: current `mode uint8` |
 
 Error byte pattern examples: `cmd = 0x83` → SET_MASK_THRESHOLDS failed; payload starts with `"len2\0"`.
@@ -292,7 +288,8 @@ width/height are always `IMG_SIZE × IMG_SIZE` (96×96 default).  Mode transitio
 |---|---|---|---|---|
 | **0 INFERENCE** (default) | ✓ | every N-th frame | ✓ (unless S3 ACK_STOP) | periodic logs + debug print every 10/30 frames |
 | **1 CAPTURE_RGB / PLAIN** | ✗ — skip interpreter, skip OOD | ✗ | ✗ — pause tx/rx state unchanged | `AA 55 AA + 96×96×3 RGB24` — AItraining ready |
-| **2 CAPTURE_GRAY / PLAIN** | ✓ GetImage only, no Invoke | ✗ | ✗ — pause | `AA 55 AA + 96×96×1 GRAY8` — AItraining ready, **what you should use by default for upper project preview** |
+| **2 CAPTURE_GRAY / PLAIN** | ✓ GetImage only, no Invoke | ✗ | ✗ — pause | `AA 55 AA + 96×96×1 GRAY8` — AItraining ready, **what you should use by default for project preview** |
+| **3 INFER_GRAY / PLAIN** | ✓ full inference + OOD | every N-th frame | ✓ | `AA 55 AA + 96×96×1 GRAY8` (the model input) — live device-vs-host comparison while S3 stays connected |
 | 11 EXT_RGB | ✗ skip Invoke | ✗ | ✗ pause | `AA 55 AB … <RGB bytes> xor8` — extended, script tools only |
 | 12 EXT_GRAY | ✓ GetImage only | ✗ | ✗ pause | `AA 55 AB … <GRAY bytes> xor8` — extended, script tools only |
 
@@ -300,7 +297,7 @@ Returning to INFERENCE via `mode infer` (or `SET_MODE 0`) automatically resumes 
 
 ---
 
-### 🧑‍🎓 Student quick recipe: "Why is Host Preview RIGHT but device NO ENTRY?"
+### 🧑‍🎓 Student quick recipe: "Why is Host Preview RIGHT but device wrong?"
 
 Use the ready-to-go script [side_by_side.py](file:///Users/koil/Google-Teachable-Machine-TFLite-model-training/TFLite/side_by_side.py) (right next to this README) — no paths to edit, no Python package hunting beyond what you already installed for AItraining.
 
@@ -309,13 +306,13 @@ Use the ready-to-go script [side_by_side.py](file:///Users/koil/Google-Teachable
 | Terminal A (Serial Monitor, 921600 8N1, NL&CR) | Terminal B (shell, `cd TFLite/`) |
 |---|---|
 | 1. Hold sign still in front of cam |  |
-| 2. `set mask 30 85` → confirm `get mask` matches Preview sliders |  |
-| 3. `mode gray` → wait for the `CAPTURE_GRAY/plain: stream sync=AA 55 AA …` banner (you can close Serial Monitor now to free the port, or leave it open on a separate machine) |  |
+| 2. `set mask 0 100` → confirm `get mask` matches the Preview slider defaults |  |
+| 3. `mode infergray` → inference keeps running AND the model-input GRAY frame streams as `AA 55 AA …` (you can close Serial Monitor now to free the port, or leave it open on a separate machine) |  |
 |  | 4. `python3 side_by_side.py --class RIGHT` → takes ~10 s, prints `MAD` score + drops `sbs_02.png` in `sbs_output/` |
 
 Open `sbs_output/sbs_00.png` side-by-side with your Host Preview "Input" crop:
-- `MAD < 3 DN` → pixels line up — go check label name order in `tm_classes.json` ↔ `labels.txt` ↔ `kCategoryNames[]`.
-- `MAD > 20 DN` or the two pictures look nothing alike → ROI / preprocessing mismatch: go force `BG_ENABLE_BLOB_SEARCH=0`, reflash, and retry; also confirm Dark/Lum match Preview exactly.
+- `MAD < 3 DN` → pixels line up — the device is feeding the model the training transform. If device labels are still wrong, check the firmware version (pre-2026-08-26 full-frame firmware has the signature "END always → RIGHT"), the OOD gate (`ood` / `flags=0xF2` = No Sign), and label name order in `tm_classes.json` ↔ `labels.txt` ↔ `kCategoryNames[]`.
+- `MAD > 20 DN` or the two pictures look nothing alike → the flashed firmware predates the center-crop fallback: reflash the current source (defaults are already host-aligned — `BG_ENABLE_BLOB_SEARCH=0`, `BG_FALLBACK_CENTER_FRAC=0.60`, mask 0/100) and retry.
 
 `python3 side_by_side.py --help` lists `--port`, `--baud`, `--host-cache-dir`, `--project-tmproj`, `--frames`, `--channels`, `--sync` overrides for non-default workflows.
 
@@ -405,20 +402,19 @@ Use `FFatReader` `bundle_runs` or `SDReader` + a plain card reader to pull the r
 
 ### OOD / preprocessing overrides (pass via -D compiler flags, not edit)
 
-All of these are `#ifndef`-guarded in `image_provider.h`. Set them per project so you never have to fork the shared `image_provider.h`.
+All of these are `#ifndef`-guarded in `image_provider.h`. The **compiled defaults already match the AItraining host** for the monochrome road-sign projects (small/upper) — you normally need NO flags:
 
 ```
-# Upper road-sign project (monochrome signs, no B-G blob, central crop)
--DBG_ENABLE_BLOB_SEARCH=0
--DBG_ENABLE_AWB=0
--DBG_FALLBACK_CENTER_FRAC=0.60f
--DBG_MASK_DARK_THRESH=30
--DBG_MASK_LUM_THRESH=85
--DOOD_ENABLE=1
--DOOD_SIGN_PCT_MIN=0.5f
--DOOD_SIGN_PCT_MAX=70.0f
--DOOD_MAX_PROB_MIN=0.70f
--DOOD_ENTROPY_RATIO_MAX=0.65f
+# Host-aligned defaults (these are the in-header defaults — no flags needed)
+BG_ENABLE_BLOB_SEARCH=0
+BG_FALLBACK_CENTER_FRAC=0.60f
+BG_MASK_DARK_THRESH=0
+BG_MASK_LUM_THRESH=100
+OOD_ENABLE=1
+OOD_SIGN_PCT_MIN=0.3f
+OOD_SIGN_PCT_MAX=70.0f
+OOD_MAX_PROB_MIN=0.60f
+OOD_ENTROPY_RATIO_MAX=0.70f
 ```
 
-For datasets where the signs do have a reliable purple/blue component (the original B-G use case), leave `BG_ENABLE_BLOB_SEARCH=1`, `BG_ENABLE_AWB=1`, and tune `BG_MASK_DARK_THRESH` / `BG_MASK_LUM_THRESH` to the union of per-class G-channel sign-mask windows.
+For datasets where the signs do have a reliable purple/blue component (the original B-G use case), set `-DBG_ENABLE_BLOB_SEARCH=1` to re-enable the B-G blob auto-crop and tune `BG_MASK_DARK_THRESH` / `BG_MASK_LUM_THRESH` to the union of per-class G-channel sign-mask windows. Note the host's `_find_bg_roi` (the Python mirror of that path) is currently dead code — if you use blob search, port your host-side verification first.

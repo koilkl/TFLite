@@ -983,29 +983,37 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   const int src_side = CameraGetRgbWidth();  // ORIGINAL capture side (96 or 160...)
   // OV5647 lib outputs at its own IMG_SIZE (160×160); everything below
   // expects IMG_SIZE×IMG_SIZE×3.  Nearest-neighbour resize (identity for
-  // IMX219).  WB gains 100/100 = passthrough; dynamic AWB happens later
-  // in BG mode.
+  // IMX219).
+  //
+  // WB gains 100/100 = passthrough.  CRITICAL for train/device parity:
+  // AItraining captures the IMX219_Grayscale_Serial stream, whose pixels
+  // are BT.601 luminance of the RAW demosaiced RGB with NO white balance
+  // (library rgb_to_gray, weights 30/59/11).  The model was therefore
+  // trained on raw (green-tinted) luminance.  The ×2.0 WB exists only in
+  // the RGB data-collection path used by other projects — it must NOT be
+  // applied to the model input of a grayscale-trained model.
   static uint8_t rgb_resized[OUT_WIDTH * OUT_HEIGHT * 3];
   resize_rgb_wb(rgb_lib, src_side, rgb_resized, 100, 100);
   const uint8_t *rgb_raw = rgb_resized;
 
-  // Center crop at the ORIGINAL resolution, matching the host fast_mode
-  // _center_bbox (side = floor(min(h,w) * 0.60)).  The crop is computed on
-  // the FULL capture frame BEFORE any downsize — cropping the 96×96
-  // downsample instead would shrink the field of view to 36 % and the model
-  // would see a completely different image than it was trained on.
+  // Center crop matching host fast_mode _center_bbox (Python
+  // image_preprocess.py: side = int(min(h,w)*frac), cx = w//2, half = side//2,
+  // left = max(0, cx - half)).  Computed in 96×96 pipeline space: the library
+  // output is already 96×96 for IMX219, and OV5647 is resized to 96×96 above,
+  // so the 96-space box covers the same 60 % FOV the host crops.
   const float kCropFrac = BG_FALLBACK_CENTER_FRAC;  // 0.60 default
-  int center_side = (int)((float)src_side * kCropFrac);   // floor, like Python int()
+  int center_side = (int)((float)OUT_WIDTH * kCropFrac);   // floor, like Python int()
   if (center_side < 2) center_side = 2;
-  if (center_side > src_side) center_side = src_side;
-  const int center_x1 = (src_side - center_side) / 2;
-  const int center_y1 = (src_side - center_side) / 2;
+  if (center_side > OUT_WIDTH) center_side = OUT_WIDTH;
+  const int center_x1 = OUT_WIDTH / 2 - center_side / 2;   // cx - half, like Python
+  const int center_y1 = OUT_HEIGHT / 2 - center_side / 2;
 
 #if PREPROCESS_MODE == PREPROCESS_MODE_GRAY
-  // ── Grayscale mode: center 60 % crop at ORIGINAL resolution (host
-  // fast_mode) → nearest resize → BT.601.  No B-G / no blob crop. ──
+  // ── Grayscale mode: center 60 % crop (host fast_mode) → bilinear →
+  // BT.601 luminance of the RAW frame (no WB — matches the grayscale
+  // serial stream AItraining trains on).  No B-G / no blob crop. ──
   _update_sign_pct_from_rgb_raw(rgb_raw, OUT_WIDTH, OUT_HEIGHT);
-  crop_resize_bilinear(rgb_lib, src_side, center_x1, center_y1, center_side, image_data);
+  crop_resize_bilinear(rgb_resized, OUT_WIDTH, center_x1, center_y1, center_side, image_data);
   contrast_stretch_int8(image_data);
   return kTfLiteOk;
 
@@ -1266,53 +1274,25 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     crop_h  = side;      if (crop_y1 + crop_h > OUT_HEIGHT) crop_h = OUT_HEIGHT - crop_y1;
   }
 
-  // ---- Step 4/5: crop from raw (never AWB'd) RGB + BT.601 luminance ----
-  // ROI detection used B-G for blob search, but the final pixels come
-  // from the ORIGINAL unmodified source — AItraining also reads raw RGB
-  // pixels (no AWB), so this keeps the two pixel distributions aligned.
+  // ---- Step 4/5: crop raw (no WB) RGB + BT.601 luminance ----
+  // ROI detection used B-G for blob search, but the final pixels come from
+  // the RAW unmodified source — identical to the pixels AItraining
+  // receives over the grayscale serial stream (library BT.601 of raw
+  // demosaiced RGB, no white balance).  No per-frame gray-world AWB:
+  // training frames carry no WB at all.
   {
     // If blob detection found a purple sign, use its box; otherwise the
-    // center fallback box.  Either way the box lives in 96-space — map it
-    // back to the ORIGINAL capture resolution and read pixels from rgb_lib
-    // (never AWB'd), so the crop behaves like the host's pre-downsize crop.
-    const int bx1 = crop_x1, by1 = crop_y1, bw = crop_w, bh = crop_h;
-    const int ox1 = bx1 * src_side / OUT_WIDTH;
-    const int oy1 = by1 * src_side / OUT_HEIGHT;
-    const int ow  = (bw * src_side + OUT_WIDTH / 2) / OUT_WIDTH;
-    const int oh  = (bh * src_side + OUT_HEIGHT / 2) / OUT_HEIGHT;
-    // Bilinear (matching PIL) from the original-resolution crop.
-    // ow/oh may differ from center_side for blob-found boxes; clamp to buffer.
-    int cw = ow; if (cw > src_side - ox1) cw = src_side - ox1;
-    int chh = oh; if (chh > src_side - oy1) chh = src_side - oy1;
+    // center fallback box.  The box lives in 96-space and rgb_resized is
+    // already 96×96, so no mapping is needed.
+    int cw = crop_w;  if (cw  > OUT_WIDTH  - crop_x1) cw  = OUT_WIDTH  - crop_x1;
+    int chh = crop_h; if (chh > OUT_HEIGHT - crop_y1) chh = OUT_HEIGHT - crop_y1;
     if (cw < 2) cw = 2;
     if (chh < 2) chh = 2;
-    crop_resize_bilinear(rgb_lib, src_side, ox1, oy1, cw > chh ? cw : chh, image_data);
+    crop_resize_bilinear(rgb_resized, OUT_WIDTH, crop_x1, crop_y1, cw > chh ? cw : chh, image_data);
   }
 
   // ---- Step 6: contrast stretch ----
   contrast_stretch_int8(image_data);
-
-  // ---- DEBUG: print model input stats every ~30 frames ----
-  {
-    static int dbg_n = 0;
-    if ((dbg_n++ % 30) == 0) {
-      int mn = 127, mx = -128;
-      long sum = 0;
-      for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-        int v = (int)image_data[i];
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
-        sum += v;
-      }
-      long cs = 0;
-      for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) cs += (image_data[i] < 0 ? -image_data[i] : image_data[i]);
-      cs = cs % 100000;
-      TFLITE_CAM_LOGI("DBG input: min=%d max=%d mean=%ld checksum=%ld first8=[%d,%d,%d,%d,%d,%d,%d,%d]",
-                      mn, mx, sum / (OUT_WIDTH * OUT_HEIGHT), cs,
-                      (int)image_data[0], (int)image_data[1], (int)image_data[2], (int)image_data[3],
-                      (int)image_data[4], (int)image_data[5], (int)image_data[6], (int)image_data[7]);
-    }
-  }
 
 #else  // PREPROCESS_MODE == RGB: handled in the sketch (streaming), not here
   TF_LITE_REPORT_ERROR(error_reporter, "GetImage not used in RGB mode");

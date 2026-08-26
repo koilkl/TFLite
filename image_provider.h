@@ -72,44 +72,47 @@
 #endif
 
 // ── Monochrome-sign (END/NO ENTRY/RIGHT) mask stats + OOD  ─────────────
-// When PREPROCESS_MODE_BG is used on *non-purple* signs, we additionally
-// compute a G-channel "sign mask" exactly like AItraining does
+// We compute a G-channel "sign mask" exactly like AItraining does
 // (sign_pct = pixels where dark_thresh < G < lum_thresh, as a percentage of
 // the full frame).  We expose the raw percentage to the sketch via
 // ImageProviderLastSignPct() so the downstream classifier can reject
 // "nothing in frame" scenes, defeating softmax's always-high-confidence
-// behaviour.  The default dark=30 / lum=85 match the "aggregate thresholds"
-// produced by image_preprocess.py::aggregate_thresholds_for_inference() for
-// the upper-project (NO ENTRY 30/80, END 32/75, RIGHT 35/85 → dark=min=30,
-// lum=max=85).  Override per-project with -D compiler flags.
+// behaviour.  In the device's default configuration (center 60 % crop,
+// BG_ENABLE_BLOB_SEARCH=0) these thresholds do NOT touch the model-input
+// pixels — they only drive the sign_pct OOD gate — so they must match the
+// host live-predict defaults (AItraining prepare_inference_inputs:
+// bg_dark_thresh=0, bg_lum_thresh=100) for the device to reject exactly the
+// same frames the host rejects.  Override per-project with -D compiler
+// flags (e.g. upper-project aggregate thresholds).
 #ifndef BG_MASK_DARK_THRESH
-#define BG_MASK_DARK_THRESH  35
+#define BG_MASK_DARK_THRESH  0
 #endif
 #ifndef BG_MASK_LUM_THRESH
-#define BG_MASK_LUM_THRESH   85
+#define BG_MASK_LUM_THRESH   100
 #endif
 
 // Inference-time OOD tuning.  If any rule fires, the sketch reports the
 // "No Sign" synthetic class (label_id == kCategoryCount, confidence = 0)
-// instead of trusting a softmax hallucination.  Disable any of these gates
-// by setting to zero.
+// instead of trusting a softmax hallucination.  Defaults match the host
+// live-predict gates (record_controller _preview_predict): sign_pct in
+// [0.3, 70] %, max_prob >= 0.60, entropy_ratio <= 0.70.  Disable any of
+// these gates by setting to zero.
 //   SIGN_PCT_MIN / SIGN_PCT_MAX: reject frames where the G-channel mask
-//       outside [min,max] % (e.g. empty road <1 %, full shadow >55 %).
-//   MAX_PROB_MIN:       reject softmax top-1 below this fraction (uint8
-//                       max_score / 255).  Default 0.70 → ~179/255.
+//       outside [min,max] % (e.g. empty road <0.3 %, full shadow >70 %).
+//   MAX_PROB_MIN:       reject softmax top-1 below this fraction.
 //   ENTROPY_RATIO_MAX:  reject "spread out" votes: -sum(p·log p) / log(N)
 //                       above this threshold.  1.0 = perfectly uniform.
 #ifndef OOD_SIGN_PCT_MIN
-#define OOD_SIGN_PCT_MIN       1.0f
+#define OOD_SIGN_PCT_MIN       0.3f
 #endif
 #ifndef OOD_SIGN_PCT_MAX
-#define OOD_SIGN_PCT_MAX       55.0f
+#define OOD_SIGN_PCT_MAX       70.0f
 #endif
 #ifndef OOD_MAX_PROB_MIN
-#define OOD_MAX_PROB_MIN       0.70f
+#define OOD_MAX_PROB_MIN       0.60f
 #endif
 #ifndef OOD_ENTROPY_RATIO_MAX
-#define OOD_ENTROPY_RATIO_MAX  0.65f
+#define OOD_ENTROPY_RATIO_MAX  0.70f
 #endif
 #ifndef OOD_ENABLE            // master switch
 #define OOD_ENABLE            1
