@@ -38,6 +38,83 @@
 #define PREPROCESS_MODE PREPROCESS_MODE_BG
 #endif
 
+// ── BG-mode tuning knobs ──────────────────────────────────────────────
+// BG_FALLBACK_CENTER_FRAC: When B-G blob detection finds no sign, the
+// pipeline used to fall back to the FULL uncropped frame.  That caused
+// a huge train/interpret mismatch because AItraining always uses a
+// central 60 % crop (see image_preprocess.py _center_bbox frac=0.60)
+// for fast-mode / cache-rebuild batches (END / NO ENTRY / RIGHT signs
+// are never purple, so the B-G blob detector always misses them).
+// Default 0.60 matches host exactly; set to 1.0 to restore old behavior.
+#ifndef BG_FALLBACK_CENTER_FRAC
+#define BG_FALLBACK_CENTER_FRAC 0.60f
+#endif
+
+// BG_ENABLE_AWB: By default the BG pipeline applies per-frame Gray-World
+// auto white balance before computing B-G differences.  That matches real
+// purple/dyed signs under varying lighting, but AItraining preprocessing
+// runs NO AWB — for signs that are pure black/white/red (END, NO ENTRY,
+// RIGHT …) disabling AWB here aligns device-side pixels with training.
+// Change to 0 on monochrome-ish sign datasets to reduce train/device drift.
+#ifndef BG_ENABLE_AWB
+#define BG_ENABLE_AWB 1
+#endif
+
+// BG_ENABLE_BLOB_SEARCH: When 0, skip the B-G mask + morphology + blob
+// step entirely and ALWAYS use the central BG_FALLBACK_CENTER_FRAC crop.
+// Use this for datasets where every sign is black-on-white and the
+// B-G blob detector never fires (matches host fast_mode exactly).
+#ifndef BG_ENABLE_BLOB_SEARCH
+#define BG_ENABLE_BLOB_SEARCH 0   // monochrome signs: skip B-G blob (false
+                                  // detections crop the wrong region and make
+                                  // the input dark) — always center 57×57 crop,
+                                  // matching host fast_mode exactly
+#endif
+
+// ── Monochrome-sign (END/NO ENTRY/RIGHT) mask stats + OOD  ─────────────
+// When PREPROCESS_MODE_BG is used on *non-purple* signs, we additionally
+// compute a G-channel "sign mask" exactly like AItraining does
+// (sign_pct = pixels where dark_thresh < G < lum_thresh, as a percentage of
+// the full frame).  We expose the raw percentage to the sketch via
+// ImageProviderLastSignPct() so the downstream classifier can reject
+// "nothing in frame" scenes, defeating softmax's always-high-confidence
+// behaviour.  The default dark=30 / lum=85 match the "aggregate thresholds"
+// produced by image_preprocess.py::aggregate_thresholds_for_inference() for
+// the upper-project (NO ENTRY 30/80, END 32/75, RIGHT 35/85 → dark=min=30,
+// lum=max=85).  Override per-project with -D compiler flags.
+#ifndef BG_MASK_DARK_THRESH
+#define BG_MASK_DARK_THRESH  35
+#endif
+#ifndef BG_MASK_LUM_THRESH
+#define BG_MASK_LUM_THRESH   85
+#endif
+
+// Inference-time OOD tuning.  If any rule fires, the sketch reports the
+// "No Sign" synthetic class (label_id == kCategoryCount, confidence = 0)
+// instead of trusting a softmax hallucination.  Disable any of these gates
+// by setting to zero.
+//   SIGN_PCT_MIN / SIGN_PCT_MAX: reject frames where the G-channel mask
+//       outside [min,max] % (e.g. empty road <1 %, full shadow >55 %).
+//   MAX_PROB_MIN:       reject softmax top-1 below this fraction (uint8
+//                       max_score / 255).  Default 0.70 → ~179/255.
+//   ENTROPY_RATIO_MAX:  reject "spread out" votes: -sum(p·log p) / log(N)
+//                       above this threshold.  1.0 = perfectly uniform.
+#ifndef OOD_SIGN_PCT_MIN
+#define OOD_SIGN_PCT_MIN       1.0f
+#endif
+#ifndef OOD_SIGN_PCT_MAX
+#define OOD_SIGN_PCT_MAX       55.0f
+#endif
+#ifndef OOD_MAX_PROB_MIN
+#define OOD_MAX_PROB_MIN       0.70f
+#endif
+#ifndef OOD_ENTROPY_RATIO_MAX
+#define OOD_ENTROPY_RATIO_MAX  0.65f
+#endif
+#ifndef OOD_ENABLE            // master switch
+#define OOD_ENABLE            1
+#endif
+
 // Crop mode: sign ROI.  Junction mode was removed.
 #define CROP_MODE_SIGN     0
 
@@ -92,5 +169,33 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width,
 
 // Function to clean up resources allocated by the image provider.
 void ImageProviderDeinit();
+
+// After GetImage() returns kTfLiteOk, returns the "sign_pct" fraction of
+// full-frame pixels whose G channel falls in (BG_MASK_DARK_THRESH,
+// BG_MASK_LUM_THRESH).  0.0 = no pixel looks like sign-black, 100.0 = every
+// pixel looks like sign-black.  The sketch uses this to short-circuit
+// out-of-distribution frames even before running inference (see OOD_*).
+// Returns 0.0 if called before the first GetImage.
+float ImageProviderLastSignPct();
+
+// Optional: override the per-frame OOD thresholds in-process (e.g. from a
+// saved setting).  Defaults come from the OOD_* macros above.  Passing
+// negative values preserves the current setting.
+void ImageProviderSetOodThresholds(float sign_pct_min, float sign_pct_max,
+                                   float max_prob_min, float entropy_ratio_max);
+
+// Read the *current* live OOD thresholds (useful when sketch code wants to
+// re-use them without re-including the macro defaults).
+void ImageProviderGetOodThresholds(float *sign_pct_min, float *sign_pct_max,
+                                   float *max_prob_min, float *entropy_ratio_max);
+
+// ── Dark / Lum (Host UI Dark/Lum sliders, G-channel sign mask) ─────────
+// Sign = G in (dark_thresh, lum_thresh).  Mirrors the Host UI bg_dark_thresh
+// / bg_lum_thresh.  Defaults come from BG_MASK_DARK/LUM_THRESH macros but
+// can be overridden at runtime (e.g. via Debug Serial commands).  Passing
+// values outside [0..255] is clamped internally, and dark >= lum is
+// corrected so dark = lum-1.
+void ImageProviderSetMaskThresholds(int dark_thresh, int lum_thresh);
+void ImageProviderGetMaskThresholds(int *dark_thresh, int *lum_thresh);
 
 #endif  // TFLITE_IMAGE_PROVIDER_H_
