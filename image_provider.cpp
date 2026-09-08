@@ -252,6 +252,32 @@ void CameraSendRgbToSerialWb(uint16_t wb_red, uint16_t wb_blue) {
   Serial.write(sync, 3);
   Serial.write(buf, sizeof(buf));
 }
+
+// Latest frame resized to IMG_SIZE×IMG_SIZE×3 (nearest-neighbour, WB
+// passthrough 100/100).  Capture modes MUST use this instead of
+// CameraGetRgb() directly: the OV5647 library buffer is 160×160×3 and
+// streaming its first IMG_SIZE×IMG_SIZE×3 bytes (row-major) tears the
+// frame — the host would reshape garbage into 96×96.  IMX219 (library
+// output already 96×96) is an identity resize.
+const uint8_t* CameraGetRgbImgSized() {
+  static uint8_t buf[OUT_WIDTH * OUT_HEIGHT * 3];
+  resize_rgb_wb(CameraGetRgb(), CameraGetRgbWidth(), buf, 100, 100);
+  return buf;
+}
+
+// Begin-once guard shared by GetImage and the capture modes in TFLite.ino.
+// The IMX219/OV5647 library begin() is NOT re-entrant: calling it a second
+// time (e.g. when a runtime mode switch re-inits a capture mode) re-runs the
+// sensor init and can hang the I2C bus — observed on the new P4 board as a
+// completely silent device after "mode rgb".  ALL camera paths must go
+// through this guard instead of calling CameraBegin() directly.
+static bool s_camera_begun_once = false;
+
+bool ImageProviderEnsureCamera() {
+  if (s_camera_begun_once) return true;
+  s_camera_begun_once = CameraBegin();
+  return s_camera_begun_once;
+}
 #endif  // TFLITE_P4_HAS_ARDUINO_CAM_LIB
 
 static int s_last_lut_mode = -1;
@@ -957,13 +983,9 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     s_backend_logged = true;
     TFLITE_CAM_LOGI("GetImage backend: %s lib (B-G diff mode)", CameraGetName());
   }
-  static bool s_ok = false;
-  if (!s_ok) {
-    s_ok = CameraBegin();
-    if (!s_ok) {
-      TF_LITE_REPORT_ERROR(error_reporter, "CameraBegin failed");
-      return kTfLiteError;
-    }
+  if (!ImageProviderEnsureCamera()) {
+    TF_LITE_REPORT_ERROR(error_reporter, "CameraBegin failed");
+    return kTfLiteError;
   }
 
   bool updated = false;

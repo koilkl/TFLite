@@ -86,14 +86,19 @@ static volatile uint32_t s_rx_bytes = 0;
 static volatile uint32_t s_rx_ack_stop = 0;
 static volatile uint32_t s_rx_resume = 0;
 
+// True while the P4 Debug Serial carries a binary frame stream (capture /
+// infer+gray modes).  Defined after s_op_mode below; declared here so the
+// UART control helpers can use it.
+static bool serial_stream_clean();
+
 static void uart_control_enable() {
   s_transmit_enabled = true;
-  Serial.println("UART TX: ENABLED");
+  if (!serial_stream_clean()) Serial.println("UART TX: ENABLED");
 }
 
 static void uart_control_disable() {
   s_transmit_enabled = false;
-  Serial.println("UART TX: DISABLED (S3 ack)");
+  if (!serial_stream_clean()) Serial.println("UART TX: DISABLED (S3 ack)");
 }
 
 static HardwareSerial UartToS3(1);
@@ -152,6 +157,25 @@ enum class OpMode : uint8_t {
   kExtCaptureGray=12 // EXTENDED: 同上 GRAY8
 };
 static volatile OpMode s_op_mode = OpMode::kInference;
+
+// True while the P4 Debug Serial carries a binary frame stream (capture /
+// infer+gray modes).  In these modes any text written to Serial splices
+// bytes into the AA 55 AA frame stream and corrupts frames for
+// AItraining's SerialFrameReader — so asynchronous text logs (SD task,
+// UART control prints) must stay off the wire.  The one-time banners and
+// the mode-transition line print before the first frame, which is safe.
+static bool serial_stream_clean() {
+  switch (s_op_mode) {
+    case OpMode::kCaptureRgb:
+    case OpMode::kCaptureGray:
+    case OpMode::kInferGray:
+    case OpMode::kExtCaptureRgb:
+    case OpMode::kExtCaptureGray:
+      return true;
+    default:
+      return false;
+  }
+}
 static const char *op_mode_name(OpMode m) {
   switch (m) {
     case OpMode::kInference:     return "INFERENCE";
@@ -254,6 +278,12 @@ struct SdPacket {
 };
 
 static QueueHandle_t s_sd_queue = nullptr;
+// Free-list of s_sd_buffers indices.  The inference task takes an index
+// from here before filling a buffer; the sd task returns it after the PGM
+// write.  Without this, a slow SD write could outlive two queued packets
+// and the ring counter would hand the SAME buffer to the producer while
+// the sd task is still reading it (torn PGM frames).
+static QueueHandle_t s_sd_free_queue = nullptr;
 static uint8_t s_sd_buffers[kSdQueueDepth][kImageBytes];
 static char s_run_dir[32] = {0};
 static bool s_sd_using_sd_mmc = false;
@@ -401,6 +431,9 @@ static void sd_task(void *arg) {
     }
 
     if (s_sd_full) {
+      // Buffer never used — return it or the free-list drains and the
+      // producer stalls on receive.
+      if (s_sd_free_queue) xQueueSend(s_sd_free_queue, &pkt.buffer_index, 0);
       continue;
     }
 
@@ -432,10 +465,16 @@ static void sd_task(void *arg) {
 
     if (!ok && errno == ENOSPC) {
       s_sd_full = true;
-      Serial.printf("Storage full (ENOSPC). Stop saving frames. Last=%s\n", path);
+      if (!serial_stream_clean()) {
+        Serial.printf("Storage full (ENOSPC). Stop saving frames. Last=%s\n", path);
+      }
     }
 
-    if ((saved % 10) == 0) {
+    // PGM write finished — return the buffer to the free-list so the
+    // producer can safely reuse it.
+    if (s_sd_free_queue) xQueueSend(s_sd_free_queue, &pkt.buffer_index, 0);
+
+    if ((saved % 10) == 0 && !serial_stream_clean()) {
       Serial.printf("SD saved=%lu last=%s %s\n", (unsigned long)saved, path, ok ? "OK" : "FAIL");
     }
   }
@@ -517,16 +556,20 @@ static void uart_rx_task(void *arg) {
       rx_idx = 0;
 
       if (rx_buf[2] != kMsgTypeControl) {
-        Serial.printf("UART RX: unknown msg_type 0x%02X (expected 0x%02X)\n",
-                      rx_buf[2], kMsgTypeControl);
+        if (!serial_stream_clean()) {
+          Serial.printf("UART RX: unknown msg_type 0x%02X (expected 0x%02X)\n",
+                        rx_buf[2], kMsgTypeControl);
+        }
         continue;
       }
 
       // Verify checksum: XOR of bytes 0-3
       uint8_t expected_csum = calc_uart_checksum(rx_buf, 4);
       if (rx_buf[4] != expected_csum) {
-        Serial.printf("UART RX: bad checksum (got 0x%02X expected 0x%02X)\n",
-                      rx_buf[4], expected_csum);
+        if (!serial_stream_clean()) {
+          Serial.printf("UART RX: bad checksum (got 0x%02X expected 0x%02X)\n",
+                        rx_buf[4], expected_csum);
+        }
         continue;
       }
 
@@ -534,26 +577,37 @@ static void uart_rx_task(void *arg) {
 
       if (cmd == kCtrlAckStop) {
         s_rx_ack_stop++;
-        Serial.printf("UART RX: ACK_STOP from S3 (#%lu) — disabling TX\n",
-                      (unsigned long)s_rx_ack_stop);
+        if (!serial_stream_clean()) {
+          Serial.printf("UART RX: ACK_STOP from S3 (#%lu) — disabling TX\n",
+                        (unsigned long)s_rx_ack_stop);
+        }
         uart_control_disable();
       } else if (cmd == kCtrlResume) {
         s_rx_resume++;
-        Serial.printf("UART RX: RESUME from S3 (#%lu) — resuming TX\n",
-                      (unsigned long)s_rx_resume);
+        if (!serial_stream_clean()) {
+          Serial.printf("UART RX: RESUME from S3 (#%lu) — resuming TX\n",
+                        (unsigned long)s_rx_resume);
+        }
         uart_control_enable();
       } else {
-        Serial.printf("UART RX: unknown control cmd 0x%02X\n", cmd);
+        if (!serial_stream_clean()) {
+          Serial.printf("UART RX: unknown control cmd 0x%02X\n", cmd);
+        }
       }
     }
 
-    // Periodic heartbeat: show RX stats even when idle
+    // Periodic heartbeat: show RX stats even when idle.
+    // NEVER print while Serial carries a binary frame stream (capture /
+    // infer+gray modes) — the text line would be injected between frames
+    // and desync the host frame parser.
     uint32_t now = millis();
     if (now - last_rx_log_ms >= 5000) {
       last_rx_log_ms = now;
-      Serial.printf("UART RX: bytes=%lu ack_stop=%lu resume=%lu tx_enabled=%d\n",
-                    (unsigned long)s_rx_bytes, (unsigned long)s_rx_ack_stop,
-                    (unsigned long)s_rx_resume, (int)s_transmit_enabled);
+      if (!serial_stream_clean()) {
+        Serial.printf("UART RX: bytes=%lu ack_stop=%lu resume=%lu tx_enabled=%d\n",
+                      (unsigned long)s_rx_bytes, (unsigned long)s_rx_ack_stop,
+                      (unsigned long)s_rx_resume, (int)s_transmit_enabled);
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -910,6 +964,10 @@ static const char* label_name(uint8_t id) {
   return "No Sign";
 }
 
+// OOD / pick helpers use fixed 32-slot score stacks — models with more
+// classes than that would silently overflow them.
+static_assert(kCategoryCount <= 32, "kCategoryCount exceeds scores_raw[32]");
+
 static void pick_label_and_confidence(TfLiteTensor *output, uint8_t *label_id, uint8_t *confidence) {
   uint8_t best_label = 0;
   int best_score = 0;
@@ -1009,7 +1067,6 @@ static void inference_task(void *arg) {
   (void)arg;
   uint16_t frame_id = 0;
   uint32_t sd_dropped = 0;
-  uint8_t next_sd_buffer = 0;
   static OpMode s_last_mode = OpMode::kInference;
 
   // Per-mode one-time state so we can re-initialise when the user flips
@@ -1017,7 +1074,7 @@ static void inference_task(void *arg) {
   static bool s_caprgb_ready   = false;
   static bool s_caprgb_banner  = false;
   static bool s_capgray_banner = false;
-static bool s_infergray_banner = false;
+  static bool s_infergray_banner = false;
   static bool s_extrgb_ready   = false;
   static bool s_extrgb_banner  = false;
   static bool s_extgray_banner = false;
@@ -1033,9 +1090,13 @@ static bool s_infergray_banner = false;
     // even if debug_serial_task writes to the volatile between checks.
     const OpMode mode = s_op_mode;
     if (mode != s_last_mode) {
-      Serial.printf("MODE: %s → %s  [frame=%u]\r\n",
-                    op_mode_name(s_last_mode), op_mode_name(mode), (unsigned)frame_id);
-      Serial.flush();
+      // Suppress the transition banner when the NEW mode streams binary
+      // frames on Serial — the text would be injected at the stream start.
+      if (!serial_stream_clean()) {
+        Serial.printf("MODE: %s → %s  [frame=%u]\r\n",
+                      op_mode_name(s_last_mode), op_mode_name(mode), (unsigned)frame_id);
+        Serial.flush();
+      }
       // On any mode transition: reset "consecutive" timing so the first
       // batch of CAPTURE frames doesn't skew averages wrong.
       total_capture_us = 0; total_invoke_us = 0; total_loop_us = 0;
@@ -1062,7 +1123,9 @@ static bool s_infergray_banner = false;
     // ─────────────────────────────────────────────────────────
     if (mode == OpMode::kCaptureRgb) {
       if (!s_caprgb_ready) {
-        s_caprgb_ready = CameraBegin();
+        // Begin-once guard: the library begin() is NOT re-entrant — a
+        // second call on a runtime mode switch can hang the I2C bus.
+        s_caprgb_ready = ImageProviderEnsureCamera();
         if (!s_caprgb_ready) {
           Serial.println("CAPTURE_RGB/plain: CameraBegin failed");
           Serial.flush();
@@ -1084,7 +1147,9 @@ static bool s_infergray_banner = false;
       if (!got_frame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
       frame_id++;
 
-      const uint8_t *rgb = CameraGetRgb();
+      // IMG_SIZE-sized copy (OV5647's 160×160 library buffer must be
+      // resized first — streaming its raw prefix tears the frame).
+      const uint8_t *rgb = CameraGetRgbImgSized();
       const size_t bytes = (size_t)IMG_SIZE * (size_t)IMG_SIZE * 3;
 
       static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
@@ -1151,7 +1216,8 @@ static bool s_infergray_banner = false;
     // ─────────────────────────────────────────────────────────
     if (mode == OpMode::kExtCaptureRgb) {
       if (!s_extrgb_ready) {
-        s_extrgb_ready = CameraBegin();
+        // Begin-once guard: see kCaptureRgb above.
+        s_extrgb_ready = ImageProviderEnsureCamera();
         if (!s_extrgb_ready) {
           Serial.println("CAPTURE_RGB/extended: CameraBegin failed");
           Serial.flush();
@@ -1171,7 +1237,7 @@ static bool s_infergray_banner = false;
       }
       if (!got_frame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
       frame_id++;
-      const uint8_t *rgb = CameraGetRgb();
+      const uint8_t *rgb = CameraGetRgbImgSized();  // IMG_SIZE-sized copy (see kCaptureRgb)
       const size_t bytes = (size_t)IMG_SIZE * (size_t)IMG_SIZE * 3;
       uint8_t hdr[3 + 1 + 2 + 2 + 2];
       hdr[0] = kCapSync0;  hdr[1] = kCapSync1;  hdr[2] = kCapExtSync2;
@@ -1278,6 +1344,33 @@ static bool s_infergray_banner = false;
     uint64_t t_capture_us = esp_timer_get_time() - t_capture_start;
     frame_id++;
 
+    // ── Snapshot the model input BEFORE Invoke ──────────────────────────
+    // CRITICAL: interpreter->Invoke() may reuse the input tensor's arena
+    // memory for intermediate tensors, so input->data.int8 is only
+    // guaranteed valid until Invoke is called.  The kInferGray stream and
+    // the SD logger must read this snapshot — reading input afterwards
+    // produced deterministic moiré garbage (conv activation scratch data).
+    static int8_t input_snapshot[IMG_SIZE * IMG_SIZE];
+    memcpy(input_snapshot, input->data.int8, sizeof(input_snapshot));
+
+    if (mode == OpMode::kInferGray) {
+      if (!s_infergray_banner) {
+        Serial.printf("INFER_GRAY: stream sync=AA 55 AA + %dx%dx1 GRAY8 (model input) — UART→S3 still active\r\n",
+                      IMG_SIZE, IMG_SIZE);
+        Serial.flush();
+        s_infergray_banner = true;
+      }
+      // Same wire format as kCaptureGray: AA 55 AA + 96×96×1 GRAY8.
+      static uint8_t gray[IMG_SIZE * IMG_SIZE];
+      for (size_t i = 0; i < (size_t)IMG_SIZE * (size_t)IMG_SIZE; i++) {
+        gray[i] = (uint8_t)((int)input_snapshot[i] + 128);
+      }
+      static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
+      Serial.write(sync, 3);
+      Serial.write(gray, sizeof(gray));
+      Serial.flush();
+    }
+
     uint64_t t_invoke_start = esp_timer_get_time();
     if (kTfLiteOk != interpreter->Invoke()) {
       Serial.println("Invoke failed");
@@ -1351,21 +1444,30 @@ static bool s_infergray_banner = false;
 
     if (mode == OpMode::kInference || mode == OpMode::kInferGray) {
       if (kEnableSdLogger && s_sd_queue && !s_sd_full && (frame_id % kSaveEveryNFrames) == 0) {
-        uint8_t *dst = s_sd_buffers[next_sd_buffer];
-        for (size_t i = 0; i < kImageBytes; i++) {
-          dst[i] = (uint8_t)((int)input->data.int8[i] + 128);
-        }
-
-        SdPacket sp;
-        sp.frame_id = frame_id;
-        sp.buffer_index = next_sd_buffer;
-        sp.flags = pkt_flags;
-        sp.label_id = label_id;
-        sp.confidence = confidence;
-        if (xQueueSend(s_sd_queue, &sp, 0) == pdTRUE) {
-          next_sd_buffer = (uint8_t)((next_sd_buffer + 1) % kSdQueueDepth);
-        } else {
+        // Take a FREE buffer first (see s_sd_free_queue comment) — never
+        // overwrite a buffer the sd task may still be writing.
+        uint8_t buf_idx = 0;
+        if (!s_sd_free_queue || xQueueReceive(s_sd_free_queue, &buf_idx, 0) != pdTRUE) {
           sd_dropped++;
+        } else {
+          uint8_t *dst = s_sd_buffers[buf_idx];
+          // Copy from the pre-Invoke snapshot — input->data.int8 is invalid
+          // after Invoke (arena reuse), it would save moiré scratch data.
+          for (size_t i = 0; i < kImageBytes; i++) {
+            dst[i] = (uint8_t)((int)input_snapshot[i] + 128);
+          }
+
+          SdPacket sp;
+          sp.frame_id = frame_id;
+          sp.buffer_index = buf_idx;
+          sp.flags = pkt_flags;
+          sp.label_id = label_id;
+          sp.confidence = confidence;
+          if (xQueueSend(s_sd_queue, &sp, 0) != pdTRUE) {
+            // sd task lagging behind — give the buffer back immediately.
+            xQueueSend(s_sd_free_queue, &buf_idx, 0);
+            sd_dropped++;
+          }
         }
       }
 
@@ -1379,19 +1481,10 @@ static bool s_infergray_banner = false;
       }
     }
 
-    if (mode == OpMode::kInferGray) {
-      // Stream the model input as GRAY on Serial (same wire format as
-      // kCaptureGray: AA 55 AA + 96×96×1 GRAY8) — no text, so AItraining's
-      // SerialFrameReader can parse it live while the S3 still gets packets.
-      static uint8_t gray[IMG_SIZE * IMG_SIZE];
-      for (size_t i = 0; i < (size_t)IMG_SIZE * (size_t)IMG_SIZE; i++) {
-        gray[i] = (uint8_t)((int)input->data.int8[i] + 128);
-      }
-      static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
-      Serial.write(sync, 3);
-      Serial.write(gray, sizeof(gray));
-      Serial.flush();
-    }
+    // NOTE: kInferGray streaming moved BEFORE interpreter->Invoke() — the
+    // arena planner may reuse the input tensor's memory for intermediate
+    // tensors during Invoke, so reading input->data.int8 afterwards yields
+    // structured garbage (moiré).  See the pre-Invoke block above.
 
     if (mode == OpMode::kInference && (frame_id % 1) == 0 && timed_frames > 0) {
       uint32_t avg_cap = (uint32_t)(total_capture_us / timed_frames);
@@ -1478,6 +1571,8 @@ void setup() {
         Serial.print("Run dir: ");
         Serial.println(s_run_dir);
         s_sd_queue = xQueueCreate(kSdQueueDepth, sizeof(SdPacket));
+        s_sd_free_queue = xQueueCreate(kSdQueueDepth, sizeof(uint8_t));
+        for (uint8_t i = 0; i < kSdQueueDepth; i++) xQueueSend(s_sd_free_queue, &i, 0);
       }
     } else if (s_sd_using_sd_mmc) {
       if (SD_MMC.cardType() == CARD_NONE) {
@@ -1488,12 +1583,18 @@ void setup() {
         Serial.print("Run dir: ");
         Serial.println(s_run_dir);
         s_sd_queue = xQueueCreate(kSdQueueDepth, sizeof(SdPacket));
+        s_sd_free_queue = xQueueCreate(kSdQueueDepth, sizeof(uint8_t));
+        for (uint8_t i = 0; i < kSdQueueDepth; i++) xQueueSend(s_sd_free_queue, &i, 0);
       }
     } else {
       Serial.println("Storage mount state invalid");
     }
   }
 
+  // GPIO10/GPIO11 crosstalk mitigation (per repo CLAUDE.md): pull the RX
+  // pin down BEFORE starting the UART so idle/noise on the S3 line can't
+  // be misread as control packets (and vice versa on the S3 side).
+  pinMode(kUartRxPin, INPUT_PULLDOWN);
   UartToS3.begin(kUartBaud, SERIAL_8N1, kUartRxPin, kUartTxPin);
   s_uart_queue = xQueueCreate(1, sizeof(UartPacket));
 

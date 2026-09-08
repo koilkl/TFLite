@@ -45,7 +45,9 @@ If the crop geometry or pixel transform diverges from the AItraining host, train
 
 ## Pipeline
 
-Camera → (resize to 96×96, WB passthrough) → center 60 % crop [20,77) → BT.601 luminance (30/59/11) → bilinear 96×96 → contrast stretch (span ≥ 24) → int8 gray−128 → TFLite int8 inference → (OOD 3-layer gating) → UART to S3 / SD log.
+Camera → (resize to 96×96, WB passthrough) → center 60 % crop [20,77) → bilinear 96×96 of the RGB crop (float32, PIL-style center mapping) → BT.601 luminance (30/59/11, round half up) → contrast stretch (span ≥ 24) → int8 gray−128 → TFLite int8 inference → (OOD 3-layer gating) → UART to S3 / SD log.
+
+`AItraining/image_preprocess.py` mirrors `crop_resize_bilinear()` bit-for-bit (same float32 arithmetic and op order), so host and device produce IDENTICAL int8 inputs from the same frame — verified with a C transliteration of the firmware on random inputs.
 
 Any change to `image_provider.cpp` must be mirrored in `AItraining/image_preprocess.py` (see repo-root `CLAUDE.md` for the canonical 6-step pipeline).
 
@@ -132,6 +134,60 @@ Commands:
 - `0x02` `RESUME` — S3 done → P4 resumes transmitting
 
 TX gating is a `volatile bool s_transmit_enabled`; when disabled the TX task drains its queue without writing. GPIO10 RX noise is mitigated with `INPUT_PULLDOWN`.
+
+## Command Reference (quick lookup)
+
+Everything the P4 accepts on the **Debug Serial (USB CDC, 921600 baud, "Both NL & CR")** in one place. Full protocol details and copy-paste recipes live in **Debug Serial Commands** (next section); the P4↔S3 channel is in **UART Protocol** (above).
+
+### ASCII commands (Arduino Serial Monitor)
+
+| Command | Example | Effect |
+|---|---|---|
+| `help` / `?` | `help` | Prints the on-device command list |
+| `ping` | `ping` → `PONG` | Connectivity check |
+| `get mask` | → `MASK: dark=0 lum=100` | Read G-channel Dark/Lum sign-mask thresholds |
+| `set mask <D> <L>` | `set mask 0 100` | Write Dark/Lum (auto-clamped so dark < lum); used by the next GetImage frame |
+| `get ood` | → `OOD: sp=0.30..70.00 mp=0.600 er=0.700` | Read the 4 OOD thresholds (see table below) |
+| `set ood <spmin> <spmax> <mpmin> <ermax>` | `set ood 0.3 70.0 0.60 0.70` | Write the 4 OOD thresholds (host-aligned defaults shown) |
+| `get mode` | → `MODE: inference` | Read the current mode |
+| `mode <keyword>` | `mode infergray` | Switch mode. Accepted keywords: `infer` / `inference` / `0`, `rgb` / `1`, `gray` / `grey` / `2`, `infergray` / `infer_gray` / `3`, `ext_rgb` / `11`, `ext_gray` / `12` |
+
+**Mode behaviour at a glance:**
+
+| # | Keyword | Invoke + OOD | UART → S3 | SD log | Debug Serial stream |
+|---|---|---|---|---|---|
+| 0 | `infer` | ✓ | ✓ | every N-th frame | text logs only |
+| 1 | `rgb` | — | — | — | `AA 55 AA` + 96×96×3 RGB24 (AItraining-ready) |
+| 2 | `gray` | — | — | — | `AA 55 AA` + 96×96×1 GRAY8 = the exact model input (AItraining-ready) |
+| 3 | `infergray` | ✓ | ✓ | every N-th frame | `AA 55 AA` + 96×96×1 GRAY8 model input; one-time `INFER_GRAY:` banner, then a clean stream — SD/UART text logs are suppressed so frames stay parseable |
+| 11 | `ext_rgb` | — | — | — | `AA 55 AB` + kind/fid/w/h + RGB + xor8 (script tools) |
+| 12 | `ext_gray` | — | — | — | `AA 55 AB` + kind/fid/w/h + GRAY8 + xor8 (script tools) |
+
+### Binary commands (sync `AA 55 CC`, Python / scripts)
+
+Frame: `AA 55 CC cmd len <payload> xor8(bytes 0..4+len)`. Error responses set `cmd | 0x80` and carry a null-terminated ASCII message.
+
+| Cmd | Name | Request payload | Response |
+|---|---|---|---|
+| `0x00` | NOP | — | ack (0 bytes) |
+| `0x7F` | PING | — | ack (0 bytes) |
+| `0x01` | SET_OOD_THRESHOLDS | 4× f32 LE (spmin, spmax, mpmin, ermax) | ack (0 bytes) |
+| `0x02` | GET_OOD_THRESHOLDS | — | 4× f32 LE, same layout |
+| `0x03` | SET_MASK_THRESHOLDS | 2× u8 (dark, lum) | ack (0 bytes) |
+| `0x04` | GET_MASK_THRESHOLDS | — | 2× u8 (dark, lum) |
+| `0x05` | SET_MODE | 1× u8 (0/1/2/3/11/12) | ack (0 bytes) |
+| `0x06` | GET_MODE | — | 1× u8 (current mode) |
+
+### What the `set ood` numbers mean
+
+| # | Parameter | Default | Gate fires "No Sign" when… |
+|---|---|---|---|
+| 1 | `spmin` — sign_pct % lower bound | 0.3 | fewer than 0.3 % of pixels are sign-candidates (scene almost empty) |
+| 2 | `spmax` — sign_pct % upper bound | 70.0 | more than 70 % (lens covered / all-dark frame) |
+| 3 | `mpmin` — softmax max probability | 0.60 | top-class confidence is below 0.60 |
+| 4 | `ermax` — normalised entropy ratio | 0.70 | entropy / log(N) exceeds 0.70 (vote spread too evenly — the model is guessing) |
+
+Any single gate firing marks the frame **No Sign** (`flags` high nibble = `0xF`). Tuning: missed signs → loosen (`spmin`↓ / `spmax`↑ / `mpmin`↓ / `ermax`↑); false detections → tighten (the opposite). The per-frame debug line (`ood: sign_pct=… max_prob=… entropy=…`) shows which layer fired — adjust only that one. The host Preview panel uses the same four numbers, so keep both ends equal. Full rationale: **OOD (No Sign) Signalling** above.
 
 ## Debug Serial Commands (USB CDC → P4, runtime tuning + capture mode)
 
@@ -259,7 +315,7 @@ Wire layout for one frame:
 **Why this matches AItraining's SerialFrameReader:**
 - [SerialFrameReader.read_frame()](file:///Users/koil/Google-Teachable-Machine-TFLite-model-training/AItraining/serial_device.py#L61-L101) looks for header=`AA 55 AA` by default then reads exactly `side² × channels` bytes.
 - It validates the *next frame header appears immediately after* (line 93-96), so **no kind/fid/w/h/xor bytes can be inserted between frames** — hence Format A strips them entirely.
-- On the firmware side, the `sign_pct` / `avg_cap` timing summary is still *printed as human-readable ASCII text every 30 frames on the debug serial port*, but it is explicitly **not injected into the pixel stream**; it appears in the debug terminal only, after the pixel data is flushed, so it's seen by the human but skipped by the frame reader's `buffer.find(AA 55 AA)` search.
+- On the firmware side, the `sign_pct` / `avg_cap` timing summary is printed as human-readable ASCII text every 30 frames on the debug serial port.  It lands *between* frames in the byte stream (after the pixel data is flushed); AItraining's frame reader tolerates it because it re-synchronises by searching for the next `AA 55 AA` header, but a strict length-based parser would desync — do not use those prints for machine parsing.
 
 ---
 
@@ -311,7 +367,7 @@ Use the ready-to-go script [side_by_side.py](file:///Users/koil/Google-Teachable
 |  | 4. `python3 side_by_side.py --class RIGHT` → takes ~10 s, prints `MAD` score + drops `sbs_02.png` in `sbs_output/` |
 
 Open `sbs_output/sbs_00.png` side-by-side with your Host Preview "Input" crop:
-- `MAD < 3 DN` → pixels line up — the device is feeding the model the training transform. If device labels are still wrong, check the firmware version (pre-2026-08-26 full-frame firmware has the signature "END always → RIGHT"), the OOD gate (`ood` / `flags=0xF2` = No Sign), and label name order in `tm_classes.json` ↔ `labels.txt` ↔ `kCategoryNames[]`.
+- `MAD < 3 DN` → pixels line up — the device is feeding the model the training transform. If device labels are still wrong, check the firmware version (pre-2026-08-26 full-frame firmware has the signature "END always → RIGHT"), the OOD gate (`ood` / `flags=0xF2` = No Sign), and label name order in `tm_classes.json` ↔ `labels.txt` ↔ `kCategoryLabels[]` (generated `model_settings.cpp`).
 - `MAD > 20 DN` or the two pictures look nothing alike → the flashed firmware predates the center-crop fallback: reflash the current source (defaults are already host-aligned — `BG_ENABLE_BLOB_SEARCH=0`, `BG_FALLBACK_CENTER_FRAC=0.60`, mask 0/100) and retry.
 
 `python3 side_by_side.py --help` lists `--port`, `--baud`, `--host-cache-dir`, `--project-tmproj`, `--frames`, `--channels`, `--sync` overrides for non-default workflows.
