@@ -71,6 +71,18 @@
                                   // matching host fast_mode exactly
 #endif
 
+// BG_ENABLE_FOCUS_SEARCH: When 1 (default), the model-input crop comes from
+// the auto shadow-search box — the C port of the host _focus_bbox
+// (bit-identical boxes, verified 65/65 frames) — so the background outside
+// the detected sign is removed from the model input.  Search failure falls
+// back to the same 40 %-side centered box the host uses.
+// MUST match the host training crop_mode ("auto_search"): retrain the model
+// after switching.  Set 0 for the legacy deterministic center 60 % crop
+// (host crop_mode "center").
+#ifndef BG_ENABLE_FOCUS_SEARCH
+#define BG_ENABLE_FOCUS_SEARCH 1
+#endif
+
 // ── Monochrome-sign (END/NO ENTRY/RIGHT) mask stats + OOD  ─────────────
 // We compute a G-channel "sign mask" exactly like AItraining does
 // (sign_pct = pixels where dark_thresh < G < lum_thresh, as a percentage of
@@ -191,6 +203,11 @@ void ImageProviderDeinit();
 // out-of-distribution frames even before running inference (see OOD_*).
 // Returns 0.0 if called before the first GetImage.
 float ImageProviderLastSignPct();
+
+// Last model-input crop box (pixel coords in 96-space): x1, y1, side.
+// Diagnostics only — the debug serial can print it for host-vs-device
+// search-box comparisons.
+void ImageProviderLastCropBox(int *x1, int *y1, int *side);
 
 // Optional: override the per-frame OOD thresholds in-process (e.g. from a
 // saved setting).  Defaults come from the OOD_* macros above.  Passing

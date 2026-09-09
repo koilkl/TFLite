@@ -845,6 +845,454 @@ static void camera_deinit(void) {
 
 #endif
 
+
+// ── Auto shadow-search crop box (host _focus_bbox C port) ──────────────
+// BIT-IDENTICAL to AItraining image_preprocess.py _focus_bbox /
+// _estimate_sign_center_and_side: deterministic float32 cumsum box blur,
+// float64 geometry chain, Python round-half-even.  Verified 65/65 identical
+// boxes against the host on random + sign-like frames.  Picks the square
+// crop the model sees when BG_ENABLE_FOCUS_SEARCH=1 (default).
+// Keep in lockstep with image_preprocess.py — any change there MUST be
+// mirrored here and vice versa.
+#include <math.h>
+#include <string.h>
+
+#define FB_W OUT_WIDTH
+#define FB_H OUT_HEIGHT
+
+// Python round(): round-half-even on exact .5 (host uses int(round(...))).
+static double py_round_d(double x) {
+  double f = floor(x);
+  if (x - f == 0.5) {
+    long r = (long)f;
+    return (r & 1) ? (double)(r + 1) : (double)r;  // round to nearest EVEN
+  }
+  return floor(x + 0.5);
+}
+static long py_round_l(double x) { return (long)py_round_d(x); }
+
+static int percentile_from_hist(const uint32_t *hist, int total, double q) {
+  if (total <= 0) return 0;
+  // rank = max(0, min(total-1, round((total-1)*q)))  (python round ~= floor(x+.5))
+  int rank = (int)py_round_d((double)(total - 1) * q);
+  if (rank < 0) rank = 0;
+  if (rank > total - 1) rank = total - 1;
+  uint32_t cdf = 0;
+  for (int i = 0; i < 256; i++) {
+    cdf += hist[i];
+    if (cdf >= (uint32_t)(rank + 1)) {
+      int idx = i;
+      if (idx < 0) idx = 0;
+      if (idx > 255) idx = 255;
+      return idx;
+    }
+  }
+  return 255;
+}
+
+// region edge map: (|dx| + |dy|) / 2, borders replicate.  Matches _edge_map_u8.
+static void edge_map_u8(const uint8_t *region, int w, int h, uint8_t *edge) {
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      int xl = (x > 0) ? region[y * w + x - 1] : region[y * w + x];
+      int xr = (x < w - 1) ? region[y * w + x + 1] : region[y * w + x];
+      int yu = (y > 0) ? region[(y - 1) * w + x] : region[y * w + x];
+      int yd = (y < h - 1) ? region[(y + 1) * w + x] : region[y * w + x];
+      int gx = xr - xl; if (gx < 0) gx = -gx;
+      int gy = yd - yu; if (gy < 0) gy = -gy;
+      int e = (gx + gy) / 2;
+      if (e > 255) e = 255;
+      edge[y * w + x] = (uint8_t)e;
+    }
+  }
+}
+
+// 4-connected bbox from seed (matches _connected_bbox_from_seed), inclusive.
+static int connected_bbox_from_seed(const uint8_t *mask, int w, int h,
+                                    int seed_x, int seed_y,
+                                    int *out_x1, int *out_y1, int *out_x2, int *out_y2) {
+  if (h <= 0 || w <= 0) return 0;
+  int sx = seed_x; if (sx < 0) sx = 0; if (sx > w - 1) sx = w - 1;
+  int sy = seed_y; if (sy < 0) sy = 0; if (sy > h - 1) sy = h - 1;
+  if (!mask[sy * w + sx]) return 0;
+  static uint8_t visited[FB_W * FB_H];
+  memset(visited, 0, sizeof(visited));
+  static int stack[FB_W * FB_H * 2];
+  int sp = 0;
+  stack[sp++] = sx; stack[sp++] = sy;
+  visited[sy * w + sx] = 1;
+  int min_x = sx, max_x = sx, min_y = sy, max_y = sy;
+  while (sp > 0) {
+    int py = stack[--sp];
+    int px = stack[--sp];
+    if (px < min_x) min_x = px; if (px > max_x) max_x = px;
+    if (py < min_y) min_y = py; if (py > max_y) max_y = py;
+    if (px > 0 && mask[py * w + px - 1] && !visited[py * w + px - 1]) { visited[py * w + px - 1] = 1; stack[sp++] = px - 1; stack[sp++] = py; }
+    if (px + 1 < w && mask[py * w + px + 1] && !visited[py * w + px + 1]) { visited[py * w + px + 1] = 1; stack[sp++] = px + 1; stack[sp++] = py; }
+    if (py > 0 && mask[(py - 1) * w + px] && !visited[(py - 1) * w + px]) { visited[(py - 1) * w + px] = 1; stack[sp++] = px; stack[sp++] = py - 1; }
+    if (py + 1 < h && mask[(py + 1) * w + px] && !visited[(py + 1) * w + px]) { visited[(py + 1) * w + px] = 1; stack[sp++] = px; stack[sp++] = py + 1; }
+  }
+  *out_x1 = min_x; *out_y1 = min_y; *out_x2 = max_x; *out_y2 = max_y;
+  return 1;
+}
+
+// weighted center inside bbox (matches _weighted_center_in_bbox), float32.
+static void weighted_center_in_bbox(const float *weight_map, int w, int h,
+                                    int bx1, int by1, int bx2, int by2,
+                                    double fb_cx, double fb_cy,
+                                    double *cx, double *cy) {
+  int x0 = bx1; if (x0 < 0) x0 = 0; if (x0 > w - 1) x0 = w - 1;
+  int y0 = by1; if (y0 < 0) y0 = 0; if (y0 > h - 1) y0 = h - 1;
+  int x1 = bx2 + 1; if (x1 < x0 + 1) x1 = x0 + 1; if (x1 > w) x1 = w;
+  int y1 = by2 + 1; if (y1 < y0 + 1) y1 = y0 + 1; if (y1 > h) y1 = h;
+  double total = 0.0, wx = 0.0, wy = 0.0;
+  for (int y = y0; y < y1; y++) {
+    for (int x = x0; x < x1; x++) {
+      double v = (double)weight_map[y * w + x];
+      if (v < 0.0) v = 0.0;
+      total += v;
+      wx += v * (double)x;
+      wy += v * (double)y;
+    }
+  }
+  if (total <= 1e-6) { *cx = fb_cx; *cy = fb_cy; return; }
+  *cx = wx / total;
+  *cy = wy / total;
+}
+
+// Separable box convolution via running sums (cumsum), zero-padded with the
+// kernel centered.  float32, sequential accumulation — BIT-IDENTICAL to the
+// host np.cumsum implementation (out[j] = P[j+K] - P[j] over the padded row).
+static void box_blur(const float *src, int w, int h, int K, float *tmp, float *dst) {
+  int half = K / 2;
+  float vpad = 0.0f;  // helper macro-less: inline bounds checks below
+  (void)vpad;
+  // horizontal pass (axis 1)
+  for (int y = 0; y < h; y++) {
+    float Pj = 0.0f, Pjk = 0.0f;
+    for (int i = 0; i < K; i++) {
+      int t = i - half;
+      if (t >= 0 && t < w) Pjk += src[y * w + t];
+    }
+    for (int j = 0; j < w; j++) {
+      tmp[y * w + j] = Pjk - Pj;
+      int t1 = j + K - half;
+      if (t1 >= 0 && t1 < w) Pjk += src[y * w + t1];
+      int t2 = j - half;
+      if (t2 >= 0 && t2 < w) Pj += src[y * w + t2];
+    }
+  }
+  // vertical pass (axis 0)
+  for (int x = 0; x < w; x++) {
+    float Pj = 0.0f, Pjk = 0.0f;
+    for (int i = 0; i < K; i++) {
+      int t = i - half;
+      if (t >= 0 && t < h) Pjk += tmp[t * w + x];
+    }
+    for (int j = 0; j < h; j++) {
+      dst[j * w + x] = Pjk - Pj;
+      int t1 = j + K - half;
+      if (t1 >= 0 && t1 < h) Pjk += tmp[t1 * w + x];
+      int t2 = j - half;
+      if (t2 >= 0 && t2 < h) Pj += tmp[t2 * w + x];
+    }
+  }
+}
+
+#define FB_SEARCH_LEFT   0.10
+#define FB_SEARCH_RIGHT  0.90
+#define FB_SEARCH_TOP    0.10
+#define FB_SEARCH_BOTTOM 0.90
+#define FB_FALLBACK_SIDE_FRAC 0.40
+#define FB_FALLBACK_CX   0.50
+#define FB_FALLBACK_CY   0.50
+#define FB_DARK_OFFSET   10
+#define FB_EDGE_PERCENTILE 0.90
+#define FB_EDGE_MIN      18
+#define FB_EDGE_RELAX    8
+#define FB_MIN_FOCUS_PIXELS 8
+#define FB_PROJECTION_FRAC 0.16
+#define FB_PRIOR_CX      0.50
+#define FB_PRIOR_CY      0.50
+#define FB_PRIOR_SX      0.18
+#define FB_PRIOR_SY      0.16
+#define FB_LOCAL_PEAK_RATIO 0.68
+#define FB_LOCAL_SIDE_SCALE 2.35
+#define FB_SUPPORT_PEAK_RATIO 0.40
+#define FB_SUPPORT_SIDE_SCALE 1.90
+#define FB_ASPECT_TARGET  1.0
+#define FB_ASPECT_TOL     0.75
+#define FB_FAR_SIDE_FRAC  0.12
+#define FB_FAR_SIDE_BOOST 1.16
+#define FB_CLOSE_SIDE_FRAC 0.22
+#define FB_CLOSE_SIDE_BOOST 1.42
+#define FB_BORDER_TOUCH_PX 2
+#define FB_BORDER_SIDE_BOOST 1.24
+#define FB_BORDER_SHIFT_FRAC 0.16
+#define FB_PEAK_CENTER_BLEND 0.68
+#define FB_CENTER_CLAMP_FRAC 0.22
+#define FB_MIN_SIDE_FRAC 0.25
+#define FB_CENTER_BIAS_X 0.10
+#define FB_CENTER_BIAS_Y -0.03
+#define FB_MAX_RUNS 4096
+
+typedef struct { int x1, y1, x2, y2; } fb_box_t;
+
+static fb_box_t find_search_box(const uint8_t *gray) {
+  fb_box_t out = {0, 0, 0, 0};
+  static float score_map[FB_W * FB_H];
+  static float tmp_buf[FB_W * FB_H];
+  static float target_map[FB_W * FB_H];
+  static uint8_t region[FB_W * FB_H];
+  static uint8_t edge[FB_W * FB_H];
+  static uint8_t mask[FB_W * FB_H];
+  static uint8_t local_mask[FB_W * FB_H];
+  static uint8_t support_mask[FB_W * FB_H];
+  static uint8_t visited[FB_W * FB_H];
+  static uint32_t hist[256];
+
+  const int w = FB_W, h = FB_H;
+  int left  = (int)py_round_d((double)w * FB_SEARCH_LEFT);
+  int right = (int)py_round_d((double)w * FB_SEARCH_RIGHT);
+  int top   = (int)py_round_d((double)h * FB_SEARCH_TOP);
+  int bottom= (int)py_round_d((double)h * FB_SEARCH_BOTTOM);
+  if (left < 0) left = 0; if (left > w - 1) left = w - 1;
+  if (right < left + 1) right = left + 1; if (right > w) right = w;
+  if (top < 0) top = 0; if (top > h - 1) top = h - 1;
+  if (bottom < top + 1) bottom = top + 1; if (bottom > h) bottom = h;
+  int sw = right - left, sh = bottom - top;
+
+  // region copy
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++)
+      region[y * sw + x] = gray[(top + y) * w + (left + x)];
+  int total = sw * sh;
+  if (total <= 0) {
+    // fallback bbox (host _fallback_bbox)
+    long side = py_round_l((double)(w < h ? w : h) * FB_FALLBACK_SIDE_FRAC);
+    if (side < 1) side = 1;
+    long cx = py_round_l((double)w * FB_FALLBACK_CX);
+    long cy = py_round_l((double)h * FB_FALLBACK_CY);
+    out.x1 = cx - side / 2; if (out.x1 < 0) out.x1 = 0; if (out.x1 > w - side) out.x1 = w - side;
+    out.y1 = cy - side / 2; if (out.y1 < 0) out.y1 = 0; if (out.y1 > h - side) out.y1 = h - side;
+    out.x2 = out.x1 + side; out.y2 = out.y1 + side;
+    return out;
+  }
+
+  // hist + percentiles
+  memset(hist, 0, sizeof(hist));
+  for (int i = 0; i < total; i++) hist[region[i]]++;
+  int p20 = percentile_from_hist(hist, total, 0.20);
+  int p35 = percentile_from_hist(hist, total, 0.35);
+  int thr = (p35 < p20 + FB_DARK_OFFSET) ? p35 : (p20 + FB_DARK_OFFSET);
+
+  edge_map_u8(region, sw, sh, edge);
+  memset(hist, 0, sizeof(hist));
+  for (int i = 0; i < total; i++) hist[edge[i]]++;
+  int edge_thr = percentile_from_hist(hist, total, (double)FB_EDGE_PERCENTILE);
+  if (edge_thr < FB_EDGE_MIN) edge_thr = FB_EDGE_MIN;
+
+  // mask + target map
+  int mask_count = 0;
+  for (int y = 0; y < sh; y++) {
+    for (int x = 0; x < sw; x++) {
+      int i = y * sw + x;
+      uint8_t m = (region[i] <= thr && edge[i] >= edge_thr) ? 1 : 0;
+      mask[i] = m;
+      mask_count += m;
+      int ds = thr - (int)region[i]; if (ds < 0) ds = 0;
+      int es = (int)edge[i] - edge_thr; if (es < 0) es = 0;
+      target_map[i] = (float)ds * ((float)es + 1.0f);
+    }
+  }
+  int relax_thr = edge_thr;
+  if (mask_count < FB_MIN_FOCUS_PIXELS) {
+    relax_thr = edge_thr - 6;
+    if (relax_thr < FB_EDGE_RELAX) relax_thr = FB_EDGE_RELAX;
+    mask_count = 0;
+    for (int y = 0; y < sh; y++) {
+      for (int x = 0; x < sw; x++) {
+        int i = y * sw + x;
+        uint8_t m = (region[i] <= p20 && edge[i] >= relax_thr) ? 1 : 0;
+        mask[i] = m;
+        mask_count += m;
+        int ds = p20 - (int)region[i]; if (ds < 0) ds = 0;
+        int es = (int)edge[i] - relax_thr; if (es < 0) es = 0;
+        target_map[i] = (float)ds * ((float)es + 1.0f);
+      }
+    }
+  }
+  if (mask_count < FB_MIN_FOCUS_PIXELS) goto fallback;
+
+  {
+    // score map: separable box convolution + gaussian priors
+    int K = (int)py_round_d((double)(sh < sw ? sh : sw) * FB_PROJECTION_FRAC);
+    if (K < 3) K = 3;
+    if (K % 2 == 0) K += 1;
+    box_blur(target_map, sw, sh, K, tmp_buf, score_map);
+    double peak = 0.0;
+    for (int i = 0; i < total; i++) if (score_map[i] > peak) peak = score_map[i];
+    if (peak <= 0.0) goto fallback;
+
+    // priors: linspace in float32 (double math cast to float), exp in double
+    // then cast to float32 — matches numpy's float32 prior arrays.
+    // host: xs = linspace(f32) then float64 arithmetic: (xs - 0.5)/sigma etc.,
+    // exp in float64 -> prior is float64.  Replicate exactly.
+    for (int y = 0; y < sh; y++) {
+      double ys = (double)(float)((double)y / (double)(sh - 1));
+      double dy = (ys - (double)FB_PRIOR_CY) / (double)FB_PRIOR_SY;
+      double py = exp(-0.5 * dy * dy);
+      for (int x = 0; x < sw; x++) {
+        double xs = (double)(float)((double)x / (double)(sw - 1));
+        double dx = (xs - (double)FB_PRIOR_CX) / (double)FB_PRIOR_SX;
+        double px = exp(-0.5 * dx * dx);
+        score_map[y * sw + x] = (score_map[y * sw + x] * py) * px;
+      }
+    }
+    peak = 0.0;
+    for (int i = 0; i < total; i++) if (score_map[i] > peak) peak = score_map[i];
+    if (peak <= 0.0) goto fallback;
+
+    double local_thr = peak * (double)FB_LOCAL_PEAK_RATIO;
+    for (int i = 0; i < total; i++) local_mask[i] = score_map[i] >= local_thr ? 1 : 0;
+
+    memset(visited, 0, sizeof(visited));
+    float best_score = -1.0f;
+    int best_span_w = 0, best_span_h = 0;
+    int best_bx1 = 0, best_by1 = 0, best_bx2 = 0, best_by2 = 0;
+    int best_peak_x = 0, best_peak_y = 0;
+
+    for (int y = 0; y < sh; y++) {
+      for (int x = 0; x < sw; x++) {
+        int i0 = y * sw + x;
+        if (!local_mask[i0] || visited[i0]) continue;
+        // BFS this component (static: 32 KB would overflow the tflm task stack)
+        static int st[FB_MAX_RUNS * 2]; int sp = 0;
+        st[sp++] = x; st[sp++] = y;
+        visited[i0] = 1;
+        int min_x = x, max_x = x, min_y = y, max_y = y;
+        double wsum = 0.0, wx = 0.0, wy = 0.0;
+        double lpeak = -1.0; int lpx = x, lpy = y;
+        while (sp > 0) {
+          int py = st[--sp];
+          int px = st[--sp];
+          int ii = py * sw + px;
+          double v = (double)score_map[ii];
+          wsum += v; wx += v * (double)px; wy += v * (double)py;
+          if (v > lpeak) { lpeak = v; lpx = px; lpy = py; }
+          if (px < min_x) min_x = px; if (px > max_x) max_x = px;
+          if (py < min_y) min_y = py; if (py > max_y) max_y = py;
+          if (px > 0 && local_mask[py * sw + px - 1] && !visited[py * sw + px - 1]) { visited[py * sw + px - 1] = 1; st[sp++] = px - 1; st[sp++] = py; }
+          if (px + 1 < sw && local_mask[py * sw + px + 1] && !visited[py * sw + px + 1]) { visited[py * sw + px + 1] = 1; st[sp++] = px + 1; st[sp++] = py; }
+          if (py > 0 && local_mask[(py - 1) * sw + px] && !visited[(py - 1) * sw + px]) { visited[(py - 1) * sw + px] = 1; st[sp++] = px; st[sp++] = py - 1; }
+          if (py + 1 < sh && local_mask[(py + 1) * sw + px] && !visited[(py + 1) * sw + px]) { visited[(py + 1) * sw + px] = 1; st[sp++] = px; st[sp++] = py + 1; }
+        }
+        if (wsum <= 0.0) continue;
+        int span_w = max_x - min_x + 1, span_h = max_y - min_y + 1;
+        double aspect = (double)span_w / (double)(span_h > 0 ? span_h : 1);
+        double aspect_err = aspect - (double)FB_ASPECT_TARGET; if (aspect_err < 0) aspect_err = -aspect_err;
+        if (aspect_err > (double)FB_ASPECT_TOL) continue;
+        double aspect_score = 1.0 - aspect_err / (double)FB_ASPECT_TOL;
+        if (aspect_score < 0.2) aspect_score = 0.2;
+        double area_score = (double)(span_w * span_h) / (double)(K * K > 0 ? K * K : 1);
+        if (area_score > 1.0) area_score = 1.0;
+        double cx = (wx / wsum) / (double)(sw - 1 > 0 ? sw - 1 : 1);
+        double cy = (wy / wsum) / (double)(sh - 1 > 0 ? sh - 1 : 1);
+        double dx = (cx - (double)FB_PRIOR_CX) / (double)FB_PRIOR_SX;
+        double dy = (cy - (double)FB_PRIOR_CY) / (double)FB_PRIOR_SY;
+        double csx = exp(-0.5 * dx * dx);
+        double csy = exp(-0.5 * dy * dy);
+        double center_score = 0.35 + 0.65 * csx * csy;
+        double sc = wsum * aspect_score * (0.6 + 0.4 * area_score) * center_score;
+        if (sc > best_score) {
+          best_score = sc;
+          best_span_w = span_w; best_span_h = span_h;
+          best_bx1 = min_x; best_by1 = min_y; best_bx2 = max_x; best_by2 = max_y;
+          best_peak_x = lpx; best_peak_y = lpy;
+        }
+      }
+    }
+    if (best_score < 0.0f) goto fallback;
+
+    double component_side_frac = (double)(best_span_w > best_span_h ? best_span_w : best_span_h) /
+                                 (double)((sh < sw ? sh : sw) > 0 ? (sh < sw ? sh : sw) : 1);
+
+    double sup_thr = (double)peak * (double)FB_SUPPORT_PEAK_RATIO;
+    for (int i = 0; i < total; i++) support_mask[i] = (double)score_map[i] >= sup_thr ? 1 : 0;
+    int sx1, sy1, sx2, sy2;
+    if (!connected_bbox_from_seed(support_mask, sw, sh, best_peak_x, best_peak_y, &sx1, &sy1, &sx2, &sy2)) {
+      sx1 = best_bx1; sy1 = best_by1; sx2 = best_bx2; sy2 = best_by2;
+    }
+    int support_span_w = sx2 - sx1 + 1, support_span_h = sy2 - sy1 + 1;
+    int support_span = (support_span_w > support_span_h) ? support_span_w : support_span_h;
+    double est_a = (double)(best_span_w > best_span_h ? best_span_w : best_span_h) * (double)FB_LOCAL_SIDE_SCALE;
+    double est_b = (double)support_span * (double)FB_SUPPORT_SIDE_SCALE;
+    long est_side = py_round_l(est_a > est_b ? est_a : est_b);
+
+    if (component_side_frac <= (double)FB_FAR_SIDE_FRAC) est_side = py_round_l((double)est_side * (double)FB_FAR_SIDE_BOOST);
+    if (component_side_frac >= (double)FB_CLOSE_SIDE_FRAC) est_side = py_round_l((double)est_side * (double)FB_CLOSE_SIDE_BOOST);
+    int touch_left = (sx1 <= FB_BORDER_TOUCH_PX) ? 1 : 0;
+    int touch_top  = (sy1 <= FB_BORDER_TOUCH_PX) ? 1 : 0;
+    int touch_right = (sx2 >= sw - 1 - FB_BORDER_TOUCH_PX) ? 1 : 0;
+    int touch_bottom = (sy2 >= sh - 1 - FB_BORDER_TOUCH_PX) ? 1 : 0;
+    if (touch_left || touch_top || touch_right || touch_bottom)
+      est_side = py_round_l((double)est_side * (double)FB_BORDER_SIDE_BOOST);
+    if (est_side < K) est_side = K;
+    long min_side = py_round_l((double)(sh < sw ? sh : sw) * FB_MIN_SIDE_FRAC);
+    if (est_side < min_side) est_side = min_side;
+    long max_crop_side = (w < h) ? w : h;
+    if (est_side > max_crop_side) est_side = max_crop_side;
+
+    double sup_cx, sup_cy;
+    weighted_center_in_bbox(target_map, sw, sh, sx1, sy1, sx2, sy2,
+                            (double)(sx1 + sx2) * 0.5, (double)(sy1 + sy2) * 0.5,
+                            &sup_cx, &sup_cy);
+    double peak_cx = (double)best_peak_x, peak_cy = (double)best_peak_y;
+    double close_ratio = (component_side_frac - (double)FB_CLOSE_SIDE_FRAC) / (0.40 - (double)FB_CLOSE_SIDE_FRAC);
+    if (close_ratio < 0.0) close_ratio = 0.0;
+    if (close_ratio > 1.0) close_ratio = 1.0;
+    double bias_x = (double)FB_CENTER_BIAS_X * (1.0 - 0.75 * close_ratio);
+    double bias_y = (double)FB_CENTER_BIAS_Y * (1.0 - 0.50 * close_ratio);
+    double cx = ((double)FB_PEAK_CENTER_BLEND * peak_cx) + ((1.0 - (double)FB_PEAK_CENTER_BLEND) * (double)sup_cx);
+    double cy = ((double)FB_PEAK_CENTER_BLEND * peak_cy) + ((1.0 - (double)FB_PEAK_CENTER_BLEND) * (double)sup_cy);
+    cx += (double)est_side * (bias_x + (double)FB_BORDER_SHIFT_FRAC * (double)touch_right - (double)FB_BORDER_SHIFT_FRAC * (double)touch_left);
+    cy += (double)est_side * (bias_y + (double)FB_BORDER_SHIFT_FRAC * (double)touch_bottom - (double)FB_BORDER_SHIFT_FRAC * (double)touch_top);
+    double support_center_x = (double)(sx1 + sx2) * 0.5;
+    double support_center_y = (double)(sy1 + sy2) * 0.5;
+    double support_span_f = (double)((sx2 - sx1 + 1) > (sy2 - sy1 + 1) ? (sx2 - sx1 + 1) : (sy2 - sy1 + 1));
+    double center_limit = 2.0;
+    if (support_span_f * 0.5 > center_limit) center_limit = support_span_f * 0.5;
+    if ((double)est_side * (double)FB_CENTER_CLAMP_FRAC > center_limit) center_limit = (double)est_side * (double)FB_CENTER_CLAMP_FRAC;
+    if (cx < support_center_x - center_limit) cx = support_center_x - center_limit;
+    if (cx > support_center_x + center_limit) cx = support_center_x + center_limit;
+    if (cy < support_center_y - center_limit) cy = support_center_y - center_limit;
+    if (cy > support_center_y + center_limit) cy = support_center_y + center_limit;
+    cx += (double)left;
+    cy += (double)top;
+    if (est_side > max_crop_side) est_side = max_crop_side;
+    long crop_left = py_round_l(cx - (double)est_side * 0.5);
+    long crop_top  = py_round_l(cy - (double)est_side * 0.5);
+    if (crop_left < 0) crop_left = 0;
+    if (crop_left > (long)w - est_side) crop_left = (long)w - est_side;
+    if (crop_top < 0) crop_top = 0;
+    if (crop_top > (long)h - est_side) crop_top = (long)h - est_side;
+    out.x1 = (int)crop_left; out.y1 = (int)crop_top; out.x2 = (int)(crop_left + est_side); out.y2 = (int)(crop_top + est_side);
+    return out;
+  }
+
+fallback:
+  {
+    long side = py_round_l((double)(w < h ? w : h) * FB_FALLBACK_SIDE_FRAC);
+    if (side < 1) side = 1;
+    long cx = py_round_l((double)w * FB_FALLBACK_CX);
+    long cy = py_round_l((double)h * FB_FALLBACK_CY);
+    out.x1 = (int)(cx - side / 2); if (out.x1 < 0) out.x1 = 0; if (out.x1 > (int)w - (int)side) out.x1 = (int)w - (int)side;
+    out.y1 = (int)(cy - side / 2); if (out.y1 < 0) out.y1 = 0; if (out.y1 > (int)h - (int)side) out.y1 = (int)h - (int)side;
+    out.x2 = out.x1 + (int)side; out.y2 = out.y1 + (int)side;
+    return out;
+  }
+}
+
 // Contrast-stretch an int8 image (value = gray−128) to full [0,255] range.
 // Applied when the span is ≥ 24, matching the B-G pipeline's final step.
 // Bilinear sample of the center crop → OUT_WIDTH×OUT_HEIGHT, matching
@@ -904,6 +1352,7 @@ static void contrast_stretch_int8(int8_t *image_data) {
 
 // ── Sign-mask stats (used by OOD rejection in TFLite.ino) ──────────────
 static float s_last_sign_pct = 0.0f;
+static int s_last_crop_x1 = 0, s_last_crop_y1 = 0, s_last_crop_side = 0;
 static float s_ood_sign_pct_min      = OOD_SIGN_PCT_MIN;
 static float s_ood_sign_pct_max      = OOD_SIGN_PCT_MAX;
 static float s_ood_max_prob_min      = OOD_MAX_PROB_MIN;
@@ -941,6 +1390,13 @@ static void _update_sign_pct_from_rgb_raw(const uint8_t *rgb_raw, int w, int h) 
 }
 
 float ImageProviderLastSignPct() { return s_last_sign_pct; }
+
+// Last model-input crop box (pixel coords in 96-space) — diagnostics.
+void ImageProviderLastCropBox(int *x1, int *y1, int *side) {
+  if (x1) *x1 = s_last_crop_x1;
+  if (y1) *y1 = s_last_crop_y1;
+  if (side) *side = s_last_crop_side;
+}
 
 void ImageProviderSetOodThresholds(float sign_pct_min, float sign_pct_max,
                                    float max_prob_min, float entropy_ratio_max) {
@@ -1018,24 +1474,62 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   resize_rgb_wb(rgb_lib, src_side, rgb_resized, 100, 100);
   const uint8_t *rgb_raw = rgb_resized;
 
+  // ── Crop selection (model-input window) ─────────────────────────────
+  // BG_ENABLE_FOCUS_SEARCH=1 (default): auto shadow-search box — the host
+  // _focus_bbox C port above (bit-identical boxes) — removes background
+  // from the model input.  Search failure falls back to the same 40 %-side
+  // centered box the host uses.  =0: legacy center 60 % crop
+  // (BG_FALLBACK_CENTER_FRAC).  MUST match the crop_mode the model was
+  // trained with on the host (retrain after switching!).
+  int crop_x1, crop_y1, crop_side;
+#if BG_ENABLE_FOCUS_SEARCH
+  {
+    static uint8_t search_gray[OUT_WIDTH * OUT_HEIGHT];
+    // Host _focus_bbox runs on the MASKED G channel (non-sign pixels -> 255,
+    // thresholds = the runtime dark/lum mask settings).  Mirror it exactly so
+    // the search input is identical to AItraining's.
+    for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
+      int g = rgb_resized[i * 3 + 1];
+      search_gray[i] = (g > s_mask_dark_thresh && g < s_mask_lum_thresh)
+                           ? (uint8_t)g : 255;
+    }
+    fb_box_t box = find_search_box(search_gray);
+    crop_x1 = box.x1;
+    crop_y1 = box.y1;
+    int sx = box.x2 - box.x1;
+    int sy = box.y2 - box.y1;
+    crop_side = (sx > sy) ? sx : sy;
+    if (crop_side < 2) crop_side = 2;
+    if (crop_side > OUT_WIDTH) crop_side = OUT_WIDTH;
+    if (crop_x1 < 0) crop_x1 = 0;
+    if (crop_y1 < 0) crop_y1 = 0;
+    if (crop_x1 + crop_side > OUT_WIDTH) crop_x1 = OUT_WIDTH - crop_side;
+    if (crop_y1 + crop_side > OUT_HEIGHT) crop_y1 = OUT_HEIGHT - crop_side;
+  }
+#else
   // Center crop matching host fast_mode _center_bbox (Python
   // image_preprocess.py: side = int(min(h,w)*frac), cx = w//2, half = side//2,
   // left = max(0, cx - half)).  Computed in 96×96 pipeline space: the library
   // output is already 96×96 for IMX219, and OV5647 is resized to 96×96 above,
   // so the 96-space box covers the same 60 % FOV the host crops.
-  const float kCropFrac = BG_FALLBACK_CENTER_FRAC;  // 0.60 default
-  int center_side = (int)((float)OUT_WIDTH * kCropFrac);   // floor, like Python int()
-  if (center_side < 2) center_side = 2;
-  if (center_side > OUT_WIDTH) center_side = OUT_WIDTH;
-  const int center_x1 = OUT_WIDTH / 2 - center_side / 2;   // cx - half, like Python
-  const int center_y1 = OUT_HEIGHT / 2 - center_side / 2;
+  {
+    const float kCropFrac = BG_FALLBACK_CENTER_FRAC;  // 0.60 default
+    int center_side = (int)((float)OUT_WIDTH * kCropFrac);   // floor, like Python int()
+    if (center_side < 2) center_side = 2;
+    if (center_side > OUT_WIDTH) center_side = OUT_WIDTH;
+    crop_x1 = OUT_WIDTH / 2 - center_side / 2;   // cx - half, like Python
+    crop_y1 = OUT_HEIGHT / 2 - center_side / 2;
+    crop_side = center_side;
+  }
+#endif
 
 #if PREPROCESS_MODE == PREPROCESS_MODE_GRAY
-  // ── Grayscale mode: center 60 % crop (host fast_mode) → bilinear →
-  // BT.601 luminance of the RAW frame (no WB — matches the grayscale
-  // serial stream AItraining trains on).  No B-G / no blob crop. ──
+  // ── Grayscale mode: crop (search box or center, per BG_ENABLE_FOCUS_SEARCH)
+  // → bilinear → BT.601 luminance of the RAW frame (no WB — matches the
+  // grayscale serial stream AItraining trains on).  No B-G / no blob crop. ──
+  s_last_crop_x1 = crop_x1; s_last_crop_y1 = crop_y1; s_last_crop_side = crop_side;
   _update_sign_pct_from_rgb_raw(rgb_raw, OUT_WIDTH, OUT_HEIGHT);
-  crop_resize_bilinear(rgb_resized, OUT_WIDTH, center_x1, center_y1, center_side, image_data);
+  crop_resize_bilinear(rgb_resized, OUT_WIDTH, crop_x1, crop_y1, crop_side, image_data);
   contrast_stretch_int8(image_data);
   return kTfLiteOk;
 
@@ -1279,21 +1773,11 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   (void)bg_raw; (void)bg_u8; (void)wb_r; (void)wb_b;
 #endif  // BG_ENABLE_BLOB_SEARCH
 
-  // ---- Fallback: central crop when blob search was disabled or failed ----
+  // ---- Fallback: precomputed crop (search box / center 60 %) when the
+  // B-G blob search was disabled or failed ----
   if (!found_roi) {
-    float frac = BG_FALLBACK_CENTER_FRAC;
-    if (frac <= 0.05f) frac = 0.05f;
-    if (frac > 1.0f)   frac = 1.0f;
-    int side = (int)( (float)OUT_WIDTH * frac );  // floor, matches host _center_bbox
-    if (side < 2) side = 2;
-    if (side > OUT_WIDTH) side = OUT_WIDTH;
-    int half = side / 2;
-    int cx = OUT_WIDTH  / 2;
-    int cy = OUT_HEIGHT / 2;
-    crop_x1 = cx - half; if (crop_x1 < 0) crop_x1 = 0;
-    crop_y1 = cy - half; if (crop_y1 < 0) crop_y1 = 0;
-    crop_w  = side;      if (crop_x1 + crop_w > OUT_WIDTH)  crop_w = OUT_WIDTH  - crop_x1;
-    crop_h  = side;      if (crop_y1 + crop_h > OUT_HEIGHT) crop_h = OUT_HEIGHT - crop_y1;
+    crop_w  = crop_side; if (crop_x1 + crop_w > OUT_WIDTH)  crop_w = OUT_WIDTH  - crop_x1;
+    crop_h  = crop_side; if (crop_y1 + crop_h > OUT_HEIGHT) crop_h = OUT_HEIGHT - crop_y1;
   }
 
   // ---- Step 4/5: crop raw (no WB) RGB + BT.601 luminance ----
@@ -1310,6 +1794,8 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
     int chh = crop_h; if (chh > OUT_HEIGHT - crop_y1) chh = OUT_HEIGHT - crop_y1;
     if (cw < 2) cw = 2;
     if (chh < 2) chh = 2;
+    s_last_crop_x1 = crop_x1; s_last_crop_y1 = crop_y1;
+    s_last_crop_side = (cw > chh) ? cw : chh;
     crop_resize_bilinear(rgb_resized, OUT_WIDTH, crop_x1, crop_y1, cw > chh ? cw : chh, image_data);
   }
 

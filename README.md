@@ -28,9 +28,15 @@ Edit `image_provider.h`:
 
 | Mode | What GetImage produces | Use case |
 |---|---|---|
-| `PREPROCESS_MODE_BG` (default) | Center 60 % crop → BT.601 luminance of raw (no-WB) RGB → bilinear → contrast stretch | Sign inference — bit-matches the AItraining training cache |
-| `PREPROCESS_MODE_GRAY` | Same center crop + luminance + stretch, no colour logic at all | Identical pixels to BG in the default config |
+| `PREPROCESS_MODE_BG` (default) | Auto search-box crop (or legacy center 60 %) → bilinear → BT.601 luminance of raw (no-WB) RGB → contrast stretch | Sign inference — bit-matches the AItraining training cache |
+| `PREPROCESS_MODE_GRAY` | Same crop + luminance + stretch, no colour logic at all | Identical pixels to BG in the default config |
 | `PREPROCESS_MODE_RGB` | No inference — streams WB-corrected IMG_SIZE×IMG_SIZE×3 RGB to Serial (`0xAA 0x55 0xAA` + payload) | Data collection for AItraining purple-sign projects, like the `IMX219_RGB_Serial` example |
+
+### Crop selection (model-input window)
+
+- `BG_ENABLE_FOCUS_SEARCH=1` (default): the crop comes from the **auto shadow-search box** — a bit-identical C port of the host `_focus_bbox` (deterministic float32 cumsum blur + float64 geometry + Python round-half-even; verified 65/65 identical boxes and 20/20 bit-identical model inputs vs the host).  The search runs on the dark/lum-masked G channel exactly like AItraining, so the background outside the detected sign is removed from the model input.  Search failure falls back to the same 40 %-side centered box the host uses.
+- `BG_ENABLE_FOCUS_SEARCH=0`: legacy deterministic **center 60 % crop** (`BG_FALLBACK_CENTER_FRAC=0.60`, box [20,77)) — matches host `crop_mode="center"`.
+- The crop mode MUST match how the model was trained (host `crop_mode`, saved in the training meta; new trainings default to `auto_search`).  **Retrain + re-export the model after switching the mode.**  The per-frame debug line prints `box=[x,y,side]` for host-vs-device comparisons.
 
 The **default configuration already matches the AItraining host** (verified 2026-08-26: 86/86 training frames → 0 label flips vs the training cache):
 
@@ -451,6 +457,7 @@ Use `FFatReader` `bundle_runs` or `SDReader` + a plain card reader to pull the r
 |---|---|---|
 | `CAMERA_TYPE` | IMX219 | `CAMERA_TYPE_IMX219` / `_OV5647` / `_AUTO` (I2C probe) |
 | `PREPROCESS_MODE` | BG | `PREPROCESS_MODE_BG` / `_GRAY` / `_RGB` |
+| `BG_ENABLE_FOCUS_SEARCH` | 1 | `1` = auto shadow-search box crop (host `crop_mode="auto_search"`); `0` = legacy center 60 % crop (`crop_mode="center"`). Retrain after switching. |
 | `kDebugBaud` | 921600 | Debug serial baud |
 | `kUartBaud` | 921600 | P4↔S3 UART baud |
 | `kEnableSdLogger` | true | Save frames + labels sidecar to SD/FFat |

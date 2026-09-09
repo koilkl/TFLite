@@ -1421,6 +1421,14 @@ static void inference_task(void *arg) {
       Serial.print(max_prob, 3);
       Serial.print(" entropy=");
       Serial.print(entropy_ratio, 3);
+      {
+        int cb_x1 = 0, cb_y1 = 0, cb_side = 0;
+        ImageProviderLastCropBox(&cb_x1, &cb_y1, &cb_side);
+        Serial.print(" box=[");
+        Serial.print(cb_x1); Serial.print(",");
+        Serial.print(cb_y1); Serial.print(",");
+        Serial.print(cb_side); Serial.print("]");
+      }
       Serial.print(" → ");
       Serial.print(ood_suppressed ? "SUPPRESS(No Sign)" : "OK");
       Serial.print("  raw=[");
