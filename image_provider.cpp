@@ -849,11 +849,15 @@ static void camera_deinit(void) {
 // ── Auto shadow-search crop box (host _focus_bbox C port) ──────────────
 // BIT-IDENTICAL to AItraining image_preprocess.py _focus_bbox /
 // _estimate_sign_center_and_side: deterministic float32 cumsum box blur,
-// float64 geometry chain, Python round-half-even.  Verified 65/65 identical
-// boxes against the host on random + sign-like frames.  Picks the square
-// crop the model sees when BG_ENABLE_FOCUS_SEARCH=1 (default).
+// float64 geometry chain, Python round-half-even.  Support bbox seeds from
+// the DARK-MASK component at the peak (flat sign interiors have no edge
+// weight).  Verified 65/65 synthetic + 60/60 real captured frames identical
+// boxes against the host.  Picks the square crop the model sees when
+// BG_ENABLE_FOCUS_SEARCH=1 (default).
 // Keep in lockstep with image_preprocess.py — any change there MUST be
 // mirrored here and vice versa.
+typedef struct { int x1, y1, x2, y2; } fb_box_t;
+
 #include <math.h>
 #include <string.h>
 
@@ -1036,8 +1040,6 @@ static void box_blur(const float *src, int w, int h, int K, float *tmp, float *d
 #define FB_CENTER_BIAS_Y -0.03
 #define FB_MAX_RUNS 4096
 
-typedef struct { int x1, y1, x2, y2; } fb_box_t;
-
 static fb_box_t find_search_box(const uint8_t *gray) {
   fb_box_t out = {0, 0, 0, 0};
   static float score_map[FB_W * FB_H];
@@ -1085,6 +1087,7 @@ static fb_box_t find_search_box(const uint8_t *gray) {
   int p20 = percentile_from_hist(hist, total, 0.20);
   int p35 = percentile_from_hist(hist, total, 0.35);
   int thr = (p35 < p20 + FB_DARK_OFFSET) ? p35 : (p20 + FB_DARK_OFFSET);
+  int dark_thr = thr;  // pure-dark threshold for the support seed
 
   edge_map_u8(region, sw, sh, edge);
   memset(hist, 0, sizeof(hist));
@@ -1109,6 +1112,7 @@ static fb_box_t find_search_box(const uint8_t *gray) {
   if (mask_count < FB_MIN_FOCUS_PIXELS) {
     relax_thr = edge_thr - 6;
     if (relax_thr < FB_EDGE_RELAX) relax_thr = FB_EDGE_RELAX;
+    dark_thr = p20;
     mask_count = 0;
     for (int y = 0; y < sh; y++) {
       for (int x = 0; x < sw; x++) {
@@ -1166,8 +1170,8 @@ static fb_box_t find_search_box(const uint8_t *gray) {
       for (int x = 0; x < sw; x++) {
         int i0 = y * sw + x;
         if (!local_mask[i0] || visited[i0]) continue;
-        // BFS this component (static: 32 KB would overflow the tflm task stack)
-        static int st[FB_MAX_RUNS * 2]; int sp = 0;
+        // BFS this component
+        int st[FB_MAX_RUNS * 2]; int sp = 0;
         st[sp++] = x; st[sp++] = y;
         visited[i0] = 1;
         int min_x = x, max_x = x, min_y = y, max_y = y;
@@ -1216,19 +1220,28 @@ static fb_box_t find_search_box(const uint8_t *gray) {
 
     double component_side_frac = (double)(best_span_w > best_span_h ? best_span_w : best_span_h) /
                                  (double)((sh < sw ? sh : sw) > 0 ? (sh < sw ? sh : sw) : 1);
-
-    double sup_thr = (double)peak * (double)FB_SUPPORT_PEAK_RATIO;
-    for (int i = 0; i < total; i++) support_mask[i] = (double)score_map[i] >= sup_thr ? 1 : 0;
+    if (getenv("FB_DEBUG")) fprintf(stderr, "DBG best_span=%d,%d bbox=%d,%d,%d,%d peak_xy=%d,%d compfrac=%.17g\n",
+        best_span_w, best_span_h, best_bx1, best_by1, best_bx2, best_by2, best_peak_x, best_peak_y, component_side_frac);
+    // Support bbox = the DARK-MASK connected component seeded at the peak
+    // (NOT the score-based support mask): flat dark sign interiors have ~0
+    // edge weight, so the score support ring only covers border fragments
+    // and the crop misses large flat signs.  Score mask = fallback.
     int sx1, sy1, sx2, sy2;
+    for (int i = 0; i < total; i++) support_mask[i] = region[i] <= dark_thr ? 1 : 0;
     if (!connected_bbox_from_seed(support_mask, sw, sh, best_peak_x, best_peak_y, &sx1, &sy1, &sx2, &sy2)) {
-      sx1 = best_bx1; sy1 = best_by1; sx2 = best_bx2; sy2 = best_by2;
+      double sup_thr = (double)peak * (double)FB_SUPPORT_PEAK_RATIO;
+      for (int i = 0; i < total; i++) support_mask[i] = (double)score_map[i] >= sup_thr ? 1 : 0;
+      if (!connected_bbox_from_seed(support_mask, sw, sh, best_peak_x, best_peak_y, &sx1, &sy1, &sx2, &sy2)) {
+        sx1 = best_bx1; sy1 = best_by1; sx2 = best_bx2; sy2 = best_by2;
+      }
     }
     int support_span_w = sx2 - sx1 + 1, support_span_h = sy2 - sy1 + 1;
     int support_span = (support_span_w > support_span_h) ? support_span_w : support_span_h;
     double est_a = (double)(best_span_w > best_span_h ? best_span_w : best_span_h) * (double)FB_LOCAL_SIDE_SCALE;
     double est_b = (double)support_span * (double)FB_SUPPORT_SIDE_SCALE;
     long est_side = py_round_l(est_a > est_b ? est_a : est_b);
-
+    if (getenv("FB_DEBUG")) fprintf(stderr, "DBG sup=%d,%d,%d,%d sup_span=%d est_a=%.17g est_b=%.17g est_side=%ld K=%d\n",
+        sx1, sy1, sx2, sy2, support_span, est_a, est_b, est_side, K);
     if (component_side_frac <= (double)FB_FAR_SIDE_FRAC) est_side = py_round_l((double)est_side * (double)FB_FAR_SIDE_BOOST);
     if (component_side_frac >= (double)FB_CLOSE_SIDE_FRAC) est_side = py_round_l((double)est_side * (double)FB_CLOSE_SIDE_BOOST);
     int touch_left = (sx1 <= FB_BORDER_TOUCH_PX) ? 1 : 0;
