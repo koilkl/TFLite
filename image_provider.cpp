@@ -847,24 +847,18 @@ static void camera_deinit(void) {
 
 
 // ── Auto shadow-search crop box (host _focus_bbox C port) ──────────────
-// BIT-IDENTICAL to AItraining image_preprocess.py _focus_bbox /
-// _estimate_sign_center_and_side: deterministic float32 cumsum box blur,
-// float64 geometry chain, Python round-half-even.  Support bbox seeds from
-// the DARK-MASK component at the peak (flat sign interiors have no edge
-// weight).  Verified 65/65 synthetic + 60/60 real captured frames identical
-// boxes against the host.  Picks the square crop the model sees when
-// BG_ENABLE_FOCUS_SEARCH=1 (default).
-// Keep in lockstep with image_preprocess.py — any change there MUST be
-// mirrored here and vice versa.
+// BIT-IDENTICAL to AItraining image_preprocess.py: deterministic float32
+// cumsum box blur, float64 geometry chain, Python round-half-even.
+// find_search_box_adaptive() = exposure-adaptive band selection (smoothed-
+// histogram valleys -> per-band search -> bright-ring gate), the mirror of
+// _focus_bbox_adaptive.  Verified 65/65 synthetic + 22/22 adaptive boxes
+// against the host.  Picks the square crop the model sees when
+// BG_ENABLE_FOCUS_SEARCH=1.  Keep in lockstep with image_preprocess.py.
 typedef struct { int x1, y1, x2, y2; } fb_box_t;
-
-#include <math.h>
-#include <string.h>
 
 #define FB_W OUT_WIDTH
 #define FB_H OUT_HEIGHT
 
-// Python round(): round-half-even on exact .5 (host uses int(round(...))).
 static double py_round_d(double x) {
   double f = floor(x);
   if (x - f == 0.5) {
@@ -1171,7 +1165,7 @@ static fb_box_t find_search_box(const uint8_t *gray) {
         int i0 = y * sw + x;
         if (!local_mask[i0] || visited[i0]) continue;
         // BFS this component
-        int st[FB_MAX_RUNS * 2]; int sp = 0;
+        static int st[FB_MAX_RUNS * 2]; int sp = 0;  // static: 32 KB would overflow the task stack
         st[sp++] = x; st[sp++] = y;
         visited[i0] = 1;
         int min_x = x, max_x = x, min_y = y, max_y = y;
@@ -1192,6 +1186,15 @@ static fb_box_t find_search_box(const uint8_t *gray) {
           if (py + 1 < sh && local_mask[(py + 1) * sw + px] && !visited[(py + 1) * sw + px]) { visited[(py + 1) * sw + px] = 1; st[sp++] = px; st[sp++] = py + 1; }
         }
         if (wsum <= 0.0) continue;
+        // Background rejection: components touching >= 2 borders of the
+        // search region are the desk/surface, not the sign.
+        {
+          int tcount = (min_x <= FB_BORDER_TOUCH_PX ? 1 : 0)
+                     + (min_y <= FB_BORDER_TOUCH_PX ? 1 : 0)
+                     + (max_x >= sw - 1 - FB_BORDER_TOUCH_PX ? 1 : 0)
+                     + (max_y >= sh - 1 - FB_BORDER_TOUCH_PX ? 1 : 0);
+          if (tcount >= 2) continue;
+        }
         int span_w = max_x - min_x + 1, span_h = max_y - min_y + 1;
         double aspect = (double)span_w / (double)(span_h > 0 ? span_h : 1);
         double aspect_err = aspect - (double)FB_ASPECT_TARGET; if (aspect_err < 0) aspect_err = -aspect_err;
@@ -1220,15 +1223,15 @@ static fb_box_t find_search_box(const uint8_t *gray) {
 
     double component_side_frac = (double)(best_span_w > best_span_h ? best_span_w : best_span_h) /
                                  (double)((sh < sw ? sh : sw) > 0 ? (sh < sw ? sh : sw) : 1);
-    if (getenv("FB_DEBUG")) fprintf(stderr, "DBG best_span=%d,%d bbox=%d,%d,%d,%d peak_xy=%d,%d compfrac=%.17g\n",
-        best_span_w, best_span_h, best_bx1, best_by1, best_bx2, best_by2, best_peak_x, best_peak_y, component_side_frac);
     // Support bbox = the DARK-MASK connected component seeded at the peak
     // (NOT the score-based support mask): flat dark sign interiors have ~0
     // edge weight, so the score support ring only covers border fragments
     // and the crop misses large flat signs.  Score mask = fallback.
     int sx1, sy1, sx2, sy2;
     for (int i = 0; i < total; i++) support_mask[i] = region[i] <= dark_thr ? 1 : 0;
-    if (!connected_bbox_from_seed(support_mask, sw, sh, best_peak_x, best_peak_y, &sx1, &sy1, &sx2, &sy2)) {
+    if (!connected_bbox_from_seed(support_mask, sw, sh, best_peak_x, best_peak_y, &sx1, &sy1, &sx2, &sy2)
+        || ((sx1 <= FB_BORDER_TOUCH_PX ? 1 : 0) + (sy1 <= FB_BORDER_TOUCH_PX ? 1 : 0)
+            + (sx2 >= sw - 1 - FB_BORDER_TOUCH_PX ? 1 : 0) + (sy2 >= sh - 1 - FB_BORDER_TOUCH_PX ? 1 : 0)) >= 2) {
       double sup_thr = (double)peak * (double)FB_SUPPORT_PEAK_RATIO;
       for (int i = 0; i < total; i++) support_mask[i] = (double)score_map[i] >= sup_thr ? 1 : 0;
       if (!connected_bbox_from_seed(support_mask, sw, sh, best_peak_x, best_peak_y, &sx1, &sy1, &sx2, &sy2)) {
@@ -1240,8 +1243,6 @@ static fb_box_t find_search_box(const uint8_t *gray) {
     double est_a = (double)(best_span_w > best_span_h ? best_span_w : best_span_h) * (double)FB_LOCAL_SIDE_SCALE;
     double est_b = (double)support_span * (double)FB_SUPPORT_SIDE_SCALE;
     long est_side = py_round_l(est_a > est_b ? est_a : est_b);
-    if (getenv("FB_DEBUG")) fprintf(stderr, "DBG sup=%d,%d,%d,%d sup_span=%d est_a=%.17g est_b=%.17g est_side=%ld K=%d\n",
-        sx1, sy1, sx2, sy2, support_span, est_a, est_b, est_side, K);
     if (component_side_frac <= (double)FB_FAR_SIDE_FRAC) est_side = py_round_l((double)est_side * (double)FB_FAR_SIDE_BOOST);
     if (component_side_frac >= (double)FB_CLOSE_SIDE_FRAC) est_side = py_round_l((double)est_side * (double)FB_CLOSE_SIDE_BOOST);
     int touch_left = (sx1 <= FB_BORDER_TOUCH_PX) ? 1 : 0;
@@ -1304,6 +1305,118 @@ fallback:
     out.x2 = out.x1 + (int)side; out.y2 = out.y1 + (int)side;
     return out;
   }
+}
+
+// ── Exposure-adaptive band selection (host _focus_bbox_adaptive mirror) ──
+// Candidate gray bands from smoothed-histogram valleys; per band run the
+// classic search; keep the box whose ring is bright paper (>=35% pixels
+// >= 180).  BIT-IDENTICAL sequence to the host wrapper.
+static fb_box_t find_search_box_adaptive(const uint8_t *gray_raw) {
+  fb_box_t out = {0, 0, 0, 0};
+  static double smooth[256];
+  static uint8_t band_gray[FB_W * FB_H];
+  static uint32_t raw_hist[256];
+
+  const int w = FB_W, h = FB_H;
+  int left  = (int)py_round_d((double)w * FB_SEARCH_LEFT);
+  int right = (int)py_round_d((double)w * FB_SEARCH_RIGHT);
+  int top   = (int)py_round_d((double)h * FB_SEARCH_TOP);
+  int bottom= (int)py_round_d((double)h * FB_SEARCH_BOTTOM);
+  if (left < 0) left = 0; if (left > w - 1) left = w - 1;
+  if (right < left + 1) right = left + 1; if (right > w) right = w;
+  if (top < 0) top = 0; if (top > h - 1) top = h - 1;
+  if (bottom < top + 1) bottom = top + 1; if (bottom > h) bottom = h;
+  int sw = right - left, sh = bottom - top;
+  int total = sw * sh;
+  if (total <= 0) return find_search_box(gray_raw);
+
+  memset(raw_hist, 0, sizeof(raw_hist));
+  for (int y = 0; y < sh; y++)
+    for (int x = 0; x < sw; x++)
+      raw_hist[gray_raw[(top + y) * w + (left + x)]]++;
+
+  // smooth with a length-11 box, zero-padded (np.convolve 'same')
+  for (int i = 0; i < 256; i++) {
+    double s = 0.0;
+    for (int k = 0; k < 11; k++) {
+      int t = i + k - 5;
+      if (t >= 0 && t < 256) s += (double)raw_hist[t];
+    }
+    smooth[i] = s / 11.0;
+  }
+
+  int peaks[64]; int n_peaks = 0;
+  for (int i = 2; i < 254; i++) {
+    if (smooth[i] >= smooth[i - 1] && smooth[i] > smooth[i + 1]
+        && smooth[i] >= 0.03 * (double)total / 8.0) {
+      if (n_peaks < 64) peaks[n_peaks++] = i;
+    }
+  }
+  if (n_peaks < 2) {
+    n_peaks = 2;
+    peaks[0] = percentile_from_hist(raw_hist, total, 0.15);
+    peaks[1] = percentile_from_hist(raw_hist, total, 0.85);
+  }
+
+  // candidate bands: (argmin between a,b, hi=b) pairs + (0, first valley)
+  int lo_arr[64], hi_arr[64]; int n_bands = 0;
+  for (int k = 0; k + 1 < n_peaks; k++) {
+    int a = peaks[k], b = peaks[k + 1];
+    int best_i = a;
+    double best_v = smooth[a];
+    for (int i = a + 1; i <= b; i++) {
+      if (smooth[i] < best_v) { best_v = smooth[i]; best_i = i; }
+    }
+    lo_arr[n_bands] = best_i; hi_arr[n_bands] = b; n_bands++;
+  }
+  {
+    int p0 = peaks[0];
+    int best_i = 0;
+    double best_v = smooth[0];
+    for (int i = 1; i <= p0; i++) {
+      if (smooth[i] < best_v) { best_v = smooth[i]; best_i = i; }
+    }
+    lo_arr[n_bands] = 0;
+    hi_arr[n_bands] = p0 + best_i;   // host: v1 = peaks[0] + argmin(smooth[:peaks[0]+1])
+    if (hi_arr[n_bands] <= 0) hi_arr[n_bands] = 100;
+    n_bands++;
+  }
+
+  double best_score = -1.0;
+  int have_best = 0;
+  for (int k = 0; k < n_bands; k++) {
+    int lo = lo_arr[k], hi = hi_arr[k];
+    if (hi - lo < 10) continue;
+    for (int i = 0; i < w * h; i++) {
+      int v = gray_raw[i];
+      band_gray[i] = (v > lo && v < hi) ? (uint8_t)v : 255;
+    }
+    fb_box_t box = find_search_box(band_gray);
+    // ring bright fraction on the RAW gray
+    int pad = 4;
+    int ry1 = box.y1 - pad; if (ry1 < 0) ry1 = 0;
+    int ry2 = box.y2 + pad; if (ry2 > h) ry2 = h;
+    int rx1 = box.x1 - pad; if (rx1 < 0) rx1 = 0;
+    int rx2 = box.x2 + pad; if (rx2 > w) rx2 = w;
+    long cnt = 0, bcnt = 0;
+    for (int y = ry1; y < ry2; y++) {
+      for (int x = rx1; x < rx2; x++) {
+        if (x >= box.x1 && x < box.x2 && y >= box.y1 && y < box.y2) continue;
+        cnt++;
+        if (gray_raw[y * w + x] >= 180) bcnt++;
+      }
+    }
+    double ring = cnt > 0 ? (double)bcnt / (double)cnt : 0.0;
+    if (ring < 0.35) continue;
+    double score = ring * (double)(box.x2 - box.x1);
+    if (!have_best || score > best_score) {
+      best_score = score;
+      out = box;
+      have_best = 1;
+    }
+  }
+  if (have_best) return out;
+  return find_search_box(gray_raw);
 }
 
 // Contrast-stretch an int8 image (value = gray−128) to full [0,255] range.
@@ -1498,15 +1611,14 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
 #if BG_ENABLE_FOCUS_SEARCH
   {
     static uint8_t search_gray[OUT_WIDTH * OUT_HEIGHT];
-    // Host _focus_bbox runs on the MASKED G channel (non-sign pixels -> 255,
-    // thresholds = the runtime dark/lum mask settings).  Mirror it exactly so
-    // the search input is identical to AItraining's.
+    // The search runs on the RAW G channel with exposure-adaptive band
+    // selection (mirrors host _focus_bbox_adaptive) — a fixed dark/lum mask
+    // cannot track the sign when auto-exposure shifts the ink's gray with
+    // framing.  The mask thresholds still drive the sign_pct OOD stat only.
     for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-      int g = rgb_resized[i * 3 + 1];
-      search_gray[i] = (g > s_mask_dark_thresh && g < s_mask_lum_thresh)
-                           ? (uint8_t)g : 255;
+      search_gray[i] = rgb_resized[i * 3 + 1];
     }
-    fb_box_t box = find_search_box(search_gray);
+    fb_box_t box = find_search_box_adaptive(search_gray);
     crop_x1 = box.x1;
     crop_y1 = box.y1;
     int sx = box.x2 - box.x1;
@@ -1611,7 +1723,9 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
 #endif  // BG_ENABLE_AWB
 
   // ---- Step 1-3: B-G extraction + mask + morphology + largest blob ----
-  int crop_x1 = 0, crop_y1 = 0, crop_w = OUT_WIDTH, crop_h = OUT_HEIGHT;
+  // (crop_x1/crop_y1 come from the crop selection above; only the blob
+  // search may overwrite them, so crop_w/crop_h init as the full frame.)
+  int crop_w = OUT_WIDTH, crop_h = OUT_HEIGHT;
   bool found_roi = false;
 
 #if BG_ENABLE_BLOB_SEARCH

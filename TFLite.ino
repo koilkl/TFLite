@@ -122,7 +122,10 @@ static constexpr uint8_t kCtrlResume  = 0x02;  // S3 done → resume TX
 
 static constexpr uint32_t kUartTxTaskStackBytes = 4 * 1024;
 static constexpr uint32_t kUartRxTaskStackBytes = 4 * 1024;
-static constexpr uint32_t kInferenceTaskStackBytes = 32 * 1024;
+// The inference task needs more than 32 KB: the auto search-box chain
+// (adaptive band selection -> find_search_box -> BFS) plus ESP-NN kernels
+// overflowed a 32 KB stack (observed 2.6 KB past the bound on Core 1).
+static constexpr uint32_t kInferenceTaskStackBytes = 64 * 1024;
 static constexpr uint32_t kSdTaskStackBytes = 8 * 1024;
 static constexpr uint32_t kDebugCmdStackBytes = 6 * 1024;
 
@@ -299,7 +302,11 @@ static bool s_sd_full = false;
 // signed value.
 
 // An area of memory to use for input, output, and intermediate arrays.
-constexpr int kTensorArenaSize = 2048 * 1024; // 380KB — fits P4 sram_high block 
+// 8 MB: the default AItraining architecture (conv 32/64/128, dense 128)
+// exports ~5 MB models on multi-class datasets — a smaller arena fails
+// AllocateTensors on the device.  SRAM-first allocation below falls back
+// to PSRAM automatically.
+constexpr int kTensorArenaSize = 8192 * 1024;
 static uint8_t *tensor_arena=nullptr ;
 
 }  // namespace
