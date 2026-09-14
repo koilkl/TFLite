@@ -1070,11 +1070,49 @@ static bool ood_is_in_distribution(float sign_pct, TfLiteTensor *output,
 #endif  // OOD_ENABLE == 1
 }
 
+static uint32_t s_inference_task_stack_bytes = 0;  // set by setup() fallback so banner below
+
+// ── Per-mode timing accumulators (INTERNAL SRAM, 8-byte aligned) ────────
+// The core dump "cap=312ms → 312023ms" is a classic 32-bit half-store tear
+// of a uint64_t that lived in an unaligned / PSRAM-backed location.  Putting
+// these counters in file-scope .bss keeps them firmly in internal SRAM and
+// the aligned(8) guarantees RISC-V LWU/SWU pairs never straddle a cacheline
+// boundary on the P4's split LSU.
+static uint64_t s_total_capture_us __attribute__((aligned(8))) = 0;
+static uint64_t s_total_invoke_us  __attribute__((aligned(8))) = 0;
+static uint64_t s_total_loop_us    __attribute__((aligned(8))) = 0;
+static uint32_t s_timed_frames                          = 0;
+
+// Hard ceiling (~1000 seconds) for any accumulator.  If the math ever
+// exceeds this (store-tear / wrap / PSRAM-cache garbage) we clamp BEFORE
+// dividing for the average, so the "frame=N … cap=312023ms" line never
+// gets to the host again with a physically impossible value.
+static constexpr uint64_t kTimingUsMax = uint64_t(1000000000ULL);
+static inline uint64_t clamp_timing(uint64_t v) {
+  if (v > kTimingUsMax) v = kTimingUsMax;
+  return v;
+}
+static inline void reset_accumulators() {
+  s_total_capture_us = 0;
+  s_total_invoke_us  = 0;
+  s_total_loop_us    = 0;
+  s_timed_frames     = 0;
+}
+
 static void inference_task(void *arg) {
   (void)arg;
+  uint32_t stack_sz = s_inference_task_stack_bytes != 0
+      ? s_inference_task_stack_bytes
+      : (uint32_t)kInferenceTaskStackBytes;
+  Serial.printf("[inference_task] START on core=%d prio=%d stack=%u op_mode=%d (%s) PREPROCESS_MODE=%d\r\n",
+                xPortGetCoreID(), (int)uxTaskPriorityGet(nullptr),
+                (unsigned)stack_sz,
+                (int)s_op_mode, op_mode_name(s_op_mode), (int)PREPROCESS_MODE);
+  Serial.flush();
   uint16_t frame_id = 0;
   uint32_t sd_dropped = 0;
   static OpMode s_last_mode = OpMode::kInference;
+
 
   // Per-mode one-time state so we can re-initialise when the user flips
   // between INFERENCE and a CAPTURE mode, or across CAPTURE_A ↔ CAPTURE_B.
@@ -1085,12 +1123,6 @@ static void inference_task(void *arg) {
   static bool s_extrgb_ready   = false;
   static bool s_extrgb_banner  = false;
   static bool s_extgray_banner = false;
-
-  // Timing accumulators (microseconds)
-  uint64_t total_capture_us = 0;
-  uint64_t total_invoke_us = 0;
-  uint64_t total_loop_us = 0;
-  uint32_t timed_frames = 0;
 
   for (;;) {
     // Snapshot runtime mode once per iteration so behaviour stays consistent
@@ -1106,8 +1138,7 @@ static void inference_task(void *arg) {
       }
       // On any mode transition: reset "consecutive" timing so the first
       // batch of CAPTURE frames doesn't skew averages wrong.
-      total_capture_us = 0; total_invoke_us = 0; total_loop_us = 0;
-      timed_frames = 0;
+      reset_accumulators();
       // Reset per-mode ready/banner flags so the user can bounce between
       // capture modes (e.g. mode rgb → mode infer → mode rgb) and the
       // camera re-initialises + banner prints correctly every time.
@@ -1120,6 +1151,8 @@ static void inference_task(void *arg) {
       s_extgray_banner = false;
       s_last_mode = mode;
     }
+
+    uint32_t now_ms = millis();
 
     // ─────────────────────────────────────────────────────────
     // Plain mode kCaptureRgb — AItraining default capture panel format.
@@ -1189,7 +1222,7 @@ static void inference_task(void *arg) {
         continue;
       }
       const uint64_t t_capture_us = esp_timer_get_time() - t_capture_start;
-      total_capture_us += t_capture_us;
+      s_total_capture_us = clamp_timing(s_total_capture_us + t_capture_us);
       frame_id++;
 
       static uint8_t gray[IMG_SIZE * IMG_SIZE];
@@ -1202,11 +1235,11 @@ static void inference_task(void *arg) {
       Serial.write(gray, sizeof(gray));
       Serial.flush();
 
-      total_loop_us += (esp_timer_get_time() - t_capture_start) + t_capture_us;
-      timed_frames++;
+      s_total_loop_us = clamp_timing(s_total_loop_us + (esp_timer_get_time() - t_capture_start) + t_capture_us);
+      s_timed_frames++;
       const float sign_pct = ImageProviderLastSignPct();
-      if ((frame_id % 30) == 0 && timed_frames > 0) {
-        const uint32_t avg_cap = (uint32_t)(total_capture_us / timed_frames);
+      if ((frame_id % 30) == 0 && s_timed_frames > 0) {
+        const uint32_t avg_cap = (uint32_t)(s_total_capture_us / s_timed_frames);
         Serial.printf("CAPTURE_GRAY/plain frame=%u sign=%.1f%% avg_cap=%lums (metadata only, not sent on stream)\r\n",
                       (unsigned)frame_id, (double)sign_pct, (unsigned long)(avg_cap/1000));
         Serial.flush();
@@ -1278,7 +1311,7 @@ static void inference_task(void *arg) {
         continue;
       }
       const uint64_t t_capture_us = esp_timer_get_time() - t_capture_start;
-      total_capture_us += t_capture_us;
+      s_total_capture_us = clamp_timing(s_total_capture_us + t_capture_us);
       frame_id++;
       static uint8_t gray[IMG_SIZE * IMG_SIZE];
       for (size_t i = 0; i < (size_t)IMG_SIZE * (size_t)IMG_SIZE; i++) {
@@ -1297,11 +1330,11 @@ static void inference_task(void *arg) {
       Serial.write(gray, bytes);
       Serial.write(x);
       Serial.flush();
-      total_loop_us += (esp_timer_get_time() - t_capture_start) + t_capture_us;
-      timed_frames++;
+      s_total_loop_us = clamp_timing(s_total_loop_us + (esp_timer_get_time() - t_capture_start) + t_capture_us);
+      s_timed_frames++;
       const float sign_pct = ImageProviderLastSignPct();
-      if ((frame_id % 30) == 0 && timed_frames > 0) {
-        const uint32_t avg_cap = (uint32_t)(total_capture_us / timed_frames);
+      if ((frame_id % 30) == 0 && s_timed_frames > 0) {
+        const uint32_t avg_cap = (uint32_t)(s_total_capture_us / s_timed_frames);
         Serial.printf("CAPTURE_GRAY/extended frame=%u sign=%.1f%% avg_cap=%lums\r\n",
                       (unsigned)frame_id, (double)sign_pct, (unsigned long)(avg_cap/1000));
         Serial.flush();
@@ -1386,11 +1419,11 @@ static void inference_task(void *arg) {
     }
     uint64_t t_invoke_us = esp_timer_get_time() - t_invoke_start;
 
-    // Accumulate timing
-    total_capture_us += t_capture_us;
-    total_invoke_us += t_invoke_us;
-    total_loop_us += esp_timer_get_time() - t_loop_start;
-    timed_frames++;
+    // Accumulate timing (clamp in case of store-tear / wrap / cache garbage)
+    s_total_capture_us = clamp_timing(s_total_capture_us + t_capture_us);
+    s_total_invoke_us  = clamp_timing(s_total_invoke_us  + t_invoke_us);
+    s_total_loop_us    = clamp_timing(s_total_loop_us    + (esp_timer_get_time() - t_loop_start));
+    s_timed_frames++;
 
     TfLiteTensor* output = interpreter->output(0);
     uint8_t label_id = 0;
@@ -1501,10 +1534,13 @@ static void inference_task(void *arg) {
     // tensors during Invoke, so reading input->data.int8 afterwards yields
     // structured garbage (moiré).  See the pre-Invoke block above.
 
-    if (mode == OpMode::kInference && (frame_id % 1) == 0 && timed_frames > 0) {
-      uint32_t avg_cap = (uint32_t)(total_capture_us / timed_frames);
-      uint32_t avg_inv = (uint32_t)(total_invoke_us / timed_frames);
-      uint32_t avg_loop = (uint32_t)(total_loop_us / timed_frames);
+    if (mode == OpMode::kInference && (frame_id % 1) == 0 && s_timed_frames > 0) {
+      uint64_t cap = clamp_timing(s_total_capture_us / s_timed_frames);
+      uint64_t inv = clamp_timing(s_total_invoke_us  / s_timed_frames);
+      uint64_t lop = clamp_timing(s_total_loop_us    / s_timed_frames);
+      uint32_t avg_cap  = (uint32_t)cap;
+      uint32_t avg_inv  = (uint32_t)inv;
+      uint32_t avg_loop = (uint32_t)lop;
       Serial.print("frame=");
       Serial.print(frame_id);
       Serial.print(" label=");
@@ -1536,10 +1572,7 @@ static void inference_task(void *arg) {
         Serial.print(sd_dropped);
       }
       Serial.println();
-      total_capture_us = 0;
-      total_invoke_us = 0;
-      total_loop_us = 0;
-      timed_frames = 0;
+      reset_accumulators();
     }
 
     taskYIELD();
@@ -1666,17 +1699,17 @@ void setup() {
   tensor_arena = (uint8_t*) heap_caps_aligned_alloc(
         16,
         kTensorArenaSize,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
     );
-  const char *arena_location = "SRAM";
+  const char *arena_location = "PSRAM";
 
   if (tensor_arena == nullptr) {
     tensor_arena = (uint8_t*) heap_caps_aligned_alloc(
           16,
           kTensorArenaSize,
-          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
       );
-    arena_location = "PSRAM (SRAM full — reduce model size for speed)";
+    arena_location = "SRAM (PSRAM full — expect 2-10x slower Invoke + stack pressure)";
   }
 
     if (tensor_arena == nullptr) {
@@ -1764,7 +1797,45 @@ void setup() {
   xTaskCreatePinnedToCore(uart_tx_task, "uart_tx", kUartTxTaskStackBytes, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", kUartRxTaskStackBytes, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(debug_serial_task, "dbgser", kDebugCmdStackBytes, nullptr, 1, nullptr, 0);
-  xTaskCreatePinnedToCore(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, nullptr, 1);
+
+  auto try_create_inference = [](uint32_t stack_bytes, UBaseType_t prio, BaseType_t core) -> BaseType_t {
+    TaskHandle_t h = nullptr;
+    BaseType_t r = xTaskCreatePinnedToCore(
+        inference_task, "tflm", stack_bytes, nullptr, prio, &h, 1);
+    if (r == pdPASS) s_inference_task_stack_bytes = stack_bytes;
+    Serial.printf("[setup] xTaskCreatePinnedToCore(inference_task) stack=%u prio=%u core=%d -> rc=%d handle=%p tasks=%u "
+                  "heap_internal_8bit=%u heap_spiram=%u free_heap=%u min_free_heap=%u\r\n",
+                  (unsigned)stack_bytes, (unsigned)prio, (int)core, (int)r, (const void*)h,
+                  (unsigned)uxTaskGetNumberOfTasks(),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                  (unsigned)xPortGetFreeHeapSize(),
+                  (unsigned)xPortGetMinimumEverFreeHeapSize());
+    Serial.flush();
+    return r;
+  };
+
+  BaseType_t rc = try_create_inference(kInferenceTaskStackBytes, 3, 1);
+  if (rc != pdPASS) {
+    // Fallback 1: same stack, drop to core 0.
+    rc = try_create_inference(kInferenceTaskStackBytes, 3, 0);
+  }
+  if (rc != pdPASS) {
+    // Fallback 2: 48K stack (ESP-NN Conv2D im2col scratch fits + room for camera buffers)
+    static constexpr uint32_t kFallbackStack1 = 48u * 1024u;
+    rc = try_create_inference(kFallbackStack1, 3, 0);
+  }
+  if (rc != pdPASS) {
+    // Fallback 3: 32K stack (prio=2 to reduce preemption churn on core0)
+    static constexpr uint32_t kFallbackStack2 = 32u * 1024u;
+    rc = try_create_inference(kFallbackStack2, 2, 0);
+  }
+  if (rc != pdPASS) {
+    Serial.println("[setup] FATAL: inference_task could not be created after 4 fallbacks. "
+                   "CameraBegin / GetImage will NEVER run. Reduce static buffers, enable PSRAM task stacks, "
+                   "or move tensor_arena to PSRAM (it now goes first, check 'Tensor arena:' log).");
+    Serial.flush();
+  }
 #else
   if (kEnableSdLogger && s_sd_queue) {
     xTaskCreate(sd_task, "sd", kSdTaskStackBytes, nullptr, 1, nullptr);
@@ -1772,8 +1843,15 @@ void setup() {
   xTaskCreate(uart_tx_task, "uart_tx", kUartTxTaskStackBytes, nullptr, 2, nullptr);
   xTaskCreate(uart_rx_task, "uart_rx", kUartRxTaskStackBytes, nullptr, 2, nullptr);
   xTaskCreate(debug_serial_task, "dbgser", kDebugCmdStackBytes, nullptr, 1, nullptr);
-  xTaskCreate(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, nullptr);
+  TaskHandle_t h = nullptr;
+  BaseType_t rc = xTaskCreate(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, &h);
+  Serial.printf("[setup] xTaskCreate(inference_task) rc=%d stack=%u prio=3 handle=%p tasks=%u free_heap=%u\r\n",
+                (int)rc, (unsigned)kInferenceTaskStackBytes, (const void*)h,
+                (unsigned)uxTaskGetNumberOfTasks(), (unsigned)xPortGetFreeHeapSize());
+  Serial.flush();
 #endif
+  Serial.println("[setup] END -> returning to Arduino scheduler");
+  Serial.flush();
 }
 
 void loop() {

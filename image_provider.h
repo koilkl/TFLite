@@ -1,6 +1,12 @@
 #ifndef TFLITE_IMAGE_PROVIDER_H_
 #define TFLITE_IMAGE_PROVIDER_H_
 
+#undef ESP32_P4_IMX219_XCLK_GPIO
+#define ESP32_P4_IMX219_XCLK_GPIO 45
+#ifndef IMX219_BOARD_XCLK_GPIO
+#define IMX219_BOARD_XCLK_GPIO 45
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -21,7 +27,7 @@
 #define CAMERA_TYPE_AUTO    3
 
 #ifndef CAMERA_TYPE
-#define CAMERA_TYPE CAMERA_TYPE_IMX219
+#define CAMERA_TYPE 2
 #endif
 
 // ── Preprocessing mode ────────────────────────────────────────────────

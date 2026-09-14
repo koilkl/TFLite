@@ -17,6 +17,19 @@
 #include <sys/mman.h>
 #endif
 
+static const char *kTag = "tflite_cam";
+
+#if __has_include("esp_log.h")
+#include "esp_log.h"
+#define TFLITE_CAM_LOGI(...) ESP_LOGI(kTag, __VA_ARGS__)
+#define TFLITE_CAM_LOGW(...) ESP_LOGW(kTag, __VA_ARGS__)
+#define TFLITE_CAM_LOGE(...) ESP_LOGE(kTag, __VA_ARGS__)
+#else
+#define TFLITE_CAM_LOGI(...) do { printf("[tflite_cam][I] "); printf(__VA_ARGS__); printf("\n"); } while (0)
+#define TFLITE_CAM_LOGW(...) do { printf("[tflite_cam][W] "); printf(__VA_ARGS__); printf("\n"); } while (0)
+#define TFLITE_CAM_LOGE(...) do { printf("[tflite_cam][E] "); printf(__VA_ARGS__); printf("\n"); } while (0)
+#endif
+
 #if __has_include("esp_log.h")
 #include "esp_log.h"
 #endif
@@ -151,21 +164,28 @@ static int detect_camera_type() {
 }
 #endif  // CAMERA_TYPE == AUTO
 
+static const char *camera_type_name(int t) {
+  if (t == CAMERA_TYPE_IMX219) return "IMX219";
+  if (t == CAMERA_TYPE_OV5647) return "OV5647";
+  if (t == CAMERA_TYPE_AUTO)   return "AUTO";
+  return "UNKNOWN";
+}
+
 bool CameraBegin() {
 #if CAMERA_TYPE == CAMERA_TYPE_AUTO
   s_active_camera = detect_camera_type();
 #endif
+  bool ok = false;
   if (s_active_camera == CAMERA_TYPE_IMX219) {
 #if TFLITE_HAS_IMX219
-    return esp32_p4_imx219_begin();
+    ok = esp32_p4_imx219_begin();
 #endif
-  }
-  if (s_active_camera == CAMERA_TYPE_OV5647) {
+  } else if (s_active_camera == CAMERA_TYPE_OV5647) {
 #if TFLITE_HAS_OV5647
-    return esp32_p4_ov5647_begin();
+    ok = esp32_p4_ov5647_begin();
 #endif
   }
-  return false;
+  return ok;
 }
 
 bool CameraUpdate() {
@@ -212,14 +232,18 @@ int CameraGetRgbWidth() {
 }
 
 const char* CameraGetName() {
+  if (s_active_camera == CAMERA_TYPE_IMX219) return "IMX219";
+  if (s_active_camera == CAMERA_TYPE_OV5647) return "OV5647";
 #if CAMERA_TYPE == CAMERA_TYPE_AUTO
   if (s_active_camera == CAMERA_TYPE_AUTO) {
     int t = detect_camera_type();
-    if (t != 0) s_active_camera = t;
+    if (t != 0) {
+      s_active_camera = t;
+      if (t == CAMERA_TYPE_IMX219) return "IMX219";
+      if (t == CAMERA_TYPE_OV5647) return "OV5647";
+    }
   }
 #endif
-  if (s_active_camera == CAMERA_TYPE_IMX219) return "IMX219";
-  if (s_active_camera == CAMERA_TYPE_OV5647) return "OV5647";
   return "UNKNOWN";
 }
 
@@ -291,15 +315,6 @@ static int s_last_lut_mode = -1;
 static int *s_x_lut = NULL;
 static int *s_y_lut = NULL;
 static uint32_t s_raw_bytesperline = 0;  // actual V4L2 stride (may differ from IMG_WIDTH*5/4)
-static const char *kTag = "tflite_cam";
-
-#if __has_include("esp_log.h")
-#define TFLITE_CAM_LOGI(...) ESP_LOGI(kTag, __VA_ARGS__)
-#define TFLITE_CAM_LOGW(...) ESP_LOGW(kTag, __VA_ARGS__)
-#else
-#define TFLITE_CAM_LOGI(...) do { printf(__VA_ARGS__); printf("\n"); } while (0)
-#define TFLITE_CAM_LOGW(...) do { printf(__VA_ARGS__); printf("\n"); } while (0)
-#endif
 
 #if TFLITE_P4_IMX219_HAS_ESP_VIDEO
 static int s_fd = -1;
@@ -1560,11 +1575,6 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   }
 
 #if TFLITE_P4_IMX219_HAS_ARDUINO_IMX219_LIB
-  static bool s_backend_logged = false;
-  if (!s_backend_logged) {
-    s_backend_logged = true;
-    TFLITE_CAM_LOGI("GetImage backend: %s lib (B-G diff mode)", CameraGetName());
-  }
   if (!ImageProviderEnsureCamera()) {
     TF_LITE_REPORT_ERROR(error_reporter, "CameraBegin failed");
     return kTfLiteError;
@@ -1936,11 +1946,6 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
 
   return kTfLiteOk;
 #elif TFLITE_P4_IMX219_HAS_ESP_VIDEO
-  static bool s_backend_logged = false;
-  if (!s_backend_logged) {
-    s_backend_logged = true;
-    TFLITE_CAM_LOGI("GetImage backend: esp_video");
-  }
   if (camera_init_if_needed(error_reporter) != kTfLiteOk) {
     return kTfLiteError;
   }
