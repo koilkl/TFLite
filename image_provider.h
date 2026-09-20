@@ -144,6 +144,9 @@
 // serial-stream resolution is FRAME_SIDE, configured at the top of
 // TFLite.ino and pushed to the camera library at runtime via
 // ImageProviderConfigureCamera() (unified camera API).
+#ifndef IMG_SIZE
+#define IMG_SIZE 96
+#endif
 
 // Constants from main.ino
 #define IMG_WIDTH  1536
