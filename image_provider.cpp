@@ -185,13 +185,13 @@ bool CameraBegin() {
     // right-side up).
     esp32_p4_imx219_set_frame_side(IMG_SIZE);
     ok = esp32_p4_imx219_begin();
-    if (ok) esp32_p4_imx219_set_flip_180(true);
+    if (ok) esp32_p4_imx219_set_flip_180(CAMERA_FLIP_180);
 #endif
   } else if (s_active_camera == CAMERA_TYPE_OV5647) {
 #if TFLITE_HAS_OV5647
     esp32_p4_ov5647_set_frame_side(IMG_SIZE);
     ok = esp32_p4_ov5647_begin();
-    if (ok) esp32_p4_ov5647_set_flip_180(true);
+    if (ok) esp32_p4_ov5647_set_flip_180(CAMERA_FLIP_180);
 #endif
   }
   return ok;

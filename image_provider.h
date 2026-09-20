@@ -139,11 +139,24 @@
 // Crop mode: sign ROI.  Junction mode was removed.
 #define CROP_MODE_SIGN     0
 
-// ── Working resolution ────────────────────────────────────────────────
-// IMG_SIZE controls the pipeline resolution (default 96).  The TFLite
-// model must be exported at the same size (AItraining img_size).
+// ── USER CONFIG — the only knobs to edit ─────────────────────────────
+// IMG_SIZE: pipeline resolution (default 96).  It drives the MODEL INPUT
+// and the capture/serial streams — the camera libraries follow it at
+// runtime (unified API: set_frame_side(IMG_SIZE) in CameraBegin).  The
+// TFLite model must be exported at the SAME size from AItraining
+// (img_size) — change both and reflash.
+// Override by defining before including this header, e.g. in the .ino:
+//     #define IMG_SIZE 160
+//     #include "image_provider.h"
 #ifndef IMG_SIZE
 #define IMG_SIZE 96
+#endif
+
+// CAMERA_FLIP_180: the camera is mounted upside down on the board, so all
+// streams rotate 180° to match the data-collection (training) orientation.
+// Set false only if your mount differs.
+#ifndef CAMERA_FLIP_180
+#define CAMERA_FLIP_180 true
 #endif
 
 // Constants from main.ino
@@ -151,12 +164,6 @@
 #define IMG_HEIGHT 1232
 #define OUT_WIDTH  IMG_SIZE
 #define OUT_HEIGHT IMG_SIZE
-
-// IMG_SIZE must be defined BEFORE ESP32_P4_IMX219.h is included so the
-// library's #ifndef guard picks it up.  ESP32_P4_IMX219.cpp also includes
-// us via __has_include, so its buffers follow our IMG_SIZE too.
-// (The OV5647 library does NOT include us — it stays at its own default
-// of 160×160, and GetImage resizes to IMG_SIZE at runtime.)
 
 // ── Camera wrapper API (works for both IMX219 and OV5647) ────────────
 
