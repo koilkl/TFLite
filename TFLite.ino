@@ -1231,9 +1231,19 @@ static void inference_task(void *arg) {
         s_capgray_banner = true;
       }
 
+      // Capture a FRESH frame — the library buffers only update on
+      // esp32_p4_<cam>_update(), and reading without it re-sends the last
+      // frame forever (frozen stream).
+      bool got_frame = false;
+      for (int tries = 0; tries < 100 && !got_frame; tries++) {
+        if (CameraUpdate()) got_frame = true;
+        else delayMicroseconds(2000);
+      }
+      if (!got_frame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+      frame_id++;
+
       const uint8_t *gray_raw = CameraGetGrayImgSized();
       if (gray_raw == nullptr) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
-      frame_id++;
 
       static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
       Serial.write(sync, 3);
@@ -1299,9 +1309,18 @@ static void inference_task(void *arg) {
         Serial.flush();
         s_extgray_banner = true;
       }
+      // Capture a FRESH frame (see kCaptureGray — the library buffers
+      // only update on CameraUpdate()).
+      bool got_frame = false;
+      for (int tries = 0; tries < 100 && !got_frame; tries++) {
+        if (CameraUpdate()) got_frame = true;
+        else delayMicroseconds(2000);
+      }
+      if (!got_frame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+      frame_id++;
+
       const uint8_t *gray_raw = CameraGetGrayImgSized();
       if (gray_raw == nullptr) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
-      frame_id++;
       uint8_t hdr[3 + 1 + 2 + 2 + 2];
       hdr[0] = kCapSync0;  hdr[1] = kCapSync1;  hdr[2] = kCapExtSync2;
       hdr[3] = kCapKindGray;
