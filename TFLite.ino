@@ -1694,32 +1694,37 @@ void setup() {
   // Internal SRAM gives ~10x memory bandwidth over PSRAM — critical for
   // inference speed. Reduce model size if it doesn't fit
 
-  printf("SRAM free: %d total, %d largest block (requesting %d)\n",
-      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-      kTensorArenaSize);
+  uint32_t sram_free   = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t sram_large  = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t spiram_free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t spiram_large= (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  printf("SRAM: free=%u largest=%u | PSRAM: free=%u largest=%u | arena_req=%u\n",
+         sram_free, sram_large, spiram_free, spiram_large, (uint32_t)kTensorArenaSize);
 
   tensor_arena = (uint8_t*) heap_caps_aligned_alloc(
         16,
         kTensorArenaSize,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
     );
-  const char *arena_location = "PSRAM";
+  const char *arena_location = "SRAM";
 
   if (tensor_arena == nullptr) {
+    printf("Tensor arena: SRAM %u too small (largest=%u), falling back to PSRAM.\n",
+           sram_free, sram_large);
     tensor_arena = (uint8_t*) heap_caps_aligned_alloc(
           16,
           kTensorArenaSize,
-          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
       );
-    arena_location = "SRAM (PSRAM full — expect 2-10x slower Invoke + stack pressure)";
+    arena_location = "PSRAM (fallback: SRAM insufficient)";
   }
 
-    if (tensor_arena == nullptr) {
-        printf("Failed to allocate tensor arena!\n");
-        return;
-    }
-    printf("Tensor arena: %d bytes in %s\n", kTensorArenaSize, arena_location);
+  if (tensor_arena == nullptr) {
+    printf("Failed to allocate tensor arena!\n");
+    return;
+  }
+  printf("Tensor arena: %u bytes in %s @ %p\n",
+         (uint32_t)kTensorArenaSize, arena_location, (const void*)tensor_arena);
 
   static tflite::MicroInterpreter static_interpreter(
       model, micro_op_resolver, tensor_arena, kTensorArenaSize, nullptr, nullptr, false);
@@ -1735,6 +1740,24 @@ void setup() {
 
   // Get information about the memory area to use for the model's input.
   input = interpreter->input(0);
+
+  // ── Fool-proofing: model input size MUST match IMG_SIZE ─────────────
+  // The model's input dims are baked in at export time.  If IMG_SIZE is
+  // changed without re-exporting the model at that size, GetImage would
+  // write IMG_SIZE² bytes into a smaller tensor and corrupt the arena —
+  // fail loudly with a clear message instead.
+  if (input->dims->size < 3 ||
+      (int)input->dims->data[1] != IMG_SIZE ||
+      (int)input->dims->data[2] != IMG_SIZE) {
+    Serial.printf(
+        "FATAL: model input is %dx%d but IMG_SIZE=%d.\r\n"
+        "       Re-export the model in AItraining with img_size=%d and reflash,\r\n"
+        "       or set IMG_SIZE back to %d in image_provider.h.\r\n",
+        (int)input->dims->data[1], (int)input->dims->data[2], (int)IMG_SIZE,
+        (int)IMG_SIZE, (int)input->dims->data[1]);
+    Serial.flush();
+    for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+  }
 
   // --- Diagnostics ---
   Serial.print("Arena used: ");
@@ -1801,14 +1824,14 @@ void setup() {
   xTaskCreatePinnedToCore(uart_rx_task, "uart_rx", kUartRxTaskStackBytes, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(debug_serial_task, "dbgser", kDebugCmdStackBytes, nullptr, 1, nullptr, 0);
 
-  auto try_create_inference = [](uint32_t stack_bytes, UBaseType_t prio, BaseType_t core) -> BaseType_t {
+  auto try_create_inference = [](uint32_t stack_bytes, UBaseType_t prio) -> BaseType_t {
     TaskHandle_t h = nullptr;
     BaseType_t r = xTaskCreatePinnedToCore(
         inference_task, "tflm", stack_bytes, nullptr, prio, &h, 1);
     if (r == pdPASS) s_inference_task_stack_bytes = stack_bytes;
-    Serial.printf("[setup] xTaskCreatePinnedToCore(inference_task) stack=%u prio=%u core=%d -> rc=%d handle=%p tasks=%u "
+    Serial.printf("[setup] xTaskCreatePinnedToCore(inference_task) stack=%u prio=%u core=1 -> rc=%d handle=%p tasks=%u "
                   "heap_internal_8bit=%u heap_spiram=%u free_heap=%u min_free_heap=%u\r\n",
-                  (unsigned)stack_bytes, (unsigned)prio, (int)core, (int)r, (const void*)h,
+                  (unsigned)stack_bytes, (unsigned)prio, (int)r, (const void*)h,
                   (unsigned)uxTaskGetNumberOfTasks(),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
@@ -1818,25 +1841,23 @@ void setup() {
     return r;
   };
 
-  BaseType_t rc = try_create_inference(kInferenceTaskStackBytes, 3, 1);
+  BaseType_t rc = try_create_inference(kInferenceTaskStackBytes, 3);
   if (rc != pdPASS) {
-    // Fallback 1: same stack, drop to core 0.
-    rc = try_create_inference(kInferenceTaskStackBytes, 3, 0);
-  }
-  if (rc != pdPASS) {
-    // Fallback 2: 48K stack (ESP-NN Conv2D im2col scratch fits + room for camera buffers)
     static constexpr uint32_t kFallbackStack1 = 48u * 1024u;
-    rc = try_create_inference(kFallbackStack1, 3, 0);
+    rc = try_create_inference(kFallbackStack1, 3);
   }
   if (rc != pdPASS) {
-    // Fallback 3: 32K stack (prio=2 to reduce preemption churn on core0)
-    static constexpr uint32_t kFallbackStack2 = 32u * 1024u;
-    rc = try_create_inference(kFallbackStack2, 2, 0);
+    static constexpr uint32_t kFallbackStack2 = 48u * 1024u;
+    rc = try_create_inference(kFallbackStack2, 2);
+  }
+  if (rc != pdPASS) {
+    static constexpr uint32_t kFallbackStack3 = 32u * 1024u;
+    rc = try_create_inference(kFallbackStack3, 2);
   }
   if (rc != pdPASS) {
     Serial.println("[setup] FATAL: inference_task could not be created after 4 fallbacks. "
-                   "CameraBegin / GetImage will NEVER run. Reduce static buffers, enable PSRAM task stacks, "
-                   "or move tensor_arena to PSRAM (it now goes first, check 'Tensor arena:' log).");
+                   "CameraBegin / GetImage will NEVER run. Reduce static buffers, "
+                   "enable PSRAM task stacks, or move tensor_arena to PSRAM.");
     Serial.flush();
   }
 #else
@@ -1848,10 +1869,20 @@ void setup() {
   xTaskCreate(debug_serial_task, "dbgser", kDebugCmdStackBytes, nullptr, 1, nullptr);
   TaskHandle_t h = nullptr;
   BaseType_t rc = xTaskCreate(inference_task, "tflm", kInferenceTaskStackBytes, nullptr, 3, &h);
+  if (rc == pdPASS) s_inference_task_stack_bytes = kInferenceTaskStackBytes;
   Serial.printf("[setup] xTaskCreate(inference_task) rc=%d stack=%u prio=3 handle=%p tasks=%u free_heap=%u\r\n",
                 (int)rc, (unsigned)kInferenceTaskStackBytes, (const void*)h,
                 (unsigned)uxTaskGetNumberOfTasks(), (unsigned)xPortGetFreeHeapSize());
   Serial.flush();
+  if (rc != pdPASS) {
+    static constexpr uint32_t kFallbackStack1 = 48u * 1024u;
+    h = nullptr;
+    rc = xTaskCreate(inference_task, "tflm", kFallbackStack1, nullptr, 2, &h);
+    if (rc == pdPASS) s_inference_task_stack_bytes = kFallbackStack1;
+    Serial.printf("[setup] xTaskCreate(inference_task) FB rc=%d stack=%u prio=2 handle=%p\r\n",
+                  (int)rc, (unsigned)kFallbackStack1, (const void*)h);
+    Serial.flush();
+  }
 #endif
   Serial.println("[setup] END -> returning to Arduino scheduler");
   Serial.flush();
