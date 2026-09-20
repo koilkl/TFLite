@@ -930,22 +930,32 @@ static double py_round_d(double x) {
 static long py_round_l(double x) { return (long)py_round_d(x); }
 
 static int percentile_from_hist(const uint32_t *hist, int total, double q) {
+  // Mirrors numpy.percentile(..., method='linear', the default):
+  //   pos = (total - 1) * q
+  //   v = value_at[floor(pos)] + (pos - floor(pos)) * (value_at[ceil(pos)] - value_at[floor(pos)])
+  // int() truncation at the end, like the host's int(np.percentile(...)).
   if (total <= 0) return 0;
-  // rank = max(0, min(total-1, round((total-1)*q)))  (python round ~= floor(x+.5))
-  int rank = (int)py_round_d((double)(total - 1) * q);
-  if (rank < 0) rank = 0;
-  if (rank > total - 1) rank = total - 1;
-  uint32_t cdf = 0;
-  for (int i = 0; i < 256; i++) {
-    cdf += hist[i];
-    if (cdf >= (uint32_t)(rank + 1)) {
-      int idx = i;
-      if (idx < 0) idx = 0;
-      if (idx > 255) idx = 255;
-      return idx;
+  double pos = (double)(total - 1) * q;
+  long lo_rank = (long)floor(pos);
+  long hi_rank = (long)ceil(pos);
+  if (lo_rank < 0) lo_rank = 0;
+  if (lo_rank > total - 1) lo_rank = total - 1;
+  if (hi_rank < 0) hi_rank = 0;
+  if (hi_rank > total - 1) hi_rank = total - 1;
+  // value at a given rank = the bin whose CDF first reaches rank+1
+  int v_at(long rank) {
+    uint32_t cdf = 0;
+    for (int i = 0; i < 256; i++) {
+      cdf += hist[i];
+      if (cdf >= (uint32_t)(rank + 1)) return i;
     }
+    return 255;
   }
-  return 255;
+  int v_lo = v_at(lo_rank);
+  int v_hi = v_at(hi_rank);
+  double frac = pos - (double)lo_rank;
+  double v = (double)v_lo + frac * (double)(v_hi - v_lo);
+  return (int)v;
 }
 
 // region edge map: (|dx| + |dy|) / 2, borders replicate.  Matches _edge_map_u8.
@@ -1568,8 +1578,13 @@ static void _update_sign_pct_from_rgb_raw(const uint8_t *rgb_raw, int w, int h) 
   int total = w * h;
   int cnt = 0;
   for (int i = 0; i < total; i++) {
-    int g = (int)rgb_raw[i * 3 + 1];
-    if (g > s_mask_dark_thresh && g < s_mask_lum_thresh) cnt++;
+    uint16_t r = rgb_raw[i * 3 + 0];
+    uint16_t g = rgb_raw[i * 3 + 1];
+    uint16_t b = rgb_raw[i * 3 + 2];
+    // BT.601 luminance — same pixels the serial gray stream carries, so
+    // the host-side sign_pct OOD stat (computed from that stream) agrees.
+    int lum601 = (int)((r * 30 + g * 59 + b * 11) / 100);
+    if (lum601 > s_mask_dark_thresh && lum601 < s_mask_lum_thresh) cnt++;
   }
   s_last_sign_pct = ((float)cnt * 100.0f) / (float)total;
   (void)dark; (void)lum;   // silence unused-warn when inlining was intended above
@@ -1666,12 +1681,17 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
 #if BG_ENABLE_FOCUS_SEARCH
   {
     static uint8_t search_gray[OUT_WIDTH * OUT_HEIGHT];
-    // The search runs on the RAW G channel with exposure-adaptive band
-    // selection (mirrors host _focus_bbox_adaptive) — a fixed dark/lum mask
-    // cannot track the sign when auto-exposure shifts the ink's gray with
-    // framing.  The mask thresholds still drive the sign_pct OOD stat only.
+    // The search runs on the BT.601 luminance (the SAME pixels the serial
+    // gray stream carries, so the host pipeline — which receives that
+    // stream in infergray/capture modes — computes the identical search
+    // box).  Exposure-adaptive band selection mirrors host
+    // _focus_bbox_adaptive; the mask thresholds still drive the sign_pct
+    // OOD stat only.
     for (int i = 0; i < OUT_WIDTH * OUT_HEIGHT; i++) {
-      search_gray[i] = rgb_resized[i * 3 + 1];
+      uint16_t r = rgb_resized[i * 3 + 0];
+      uint16_t g = rgb_resized[i * 3 + 1];
+      uint16_t b = rgb_resized[i * 3 + 2];
+      search_gray[i] = (uint8_t)((r * 30 + g * 59 + b * 11) / 100);
     }
     fb_box_t box = find_search_box_adaptive(search_gray);
     crop_x1 = box.x1;
