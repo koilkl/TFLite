@@ -289,6 +289,39 @@ const uint8_t* CameraGetRgbImgSized() {
   return buf;
 }
 
+// Latest frame as GRAY8 at IMG_SIZE×IMG_SIZE, taken from the LIBRARY's own
+// BT.601 gray conversion — the exact source the IMX219_Grayscale_Serial
+// data-collection stream uses for training.  No crop, no contrast stretch,
+// library orientation.  kInferGray streams this so the host receives raw
+// frames matching the training distribution (the old path sent the
+// model-input tensor: already MCU-cropped by the search box).
+const uint8_t* CameraGetGrayImgSized() {
+  static uint8_t buf[OUT_WIDTH * OUT_HEIGHT];
+  const uint8_t* gray_lib = nullptr;
+  if (s_active_camera == CAMERA_TYPE_IMX219) {
+#if TFLITE_HAS_IMX219
+    gray_lib = esp32_p4_imx219_gray();
+#endif
+  }
+#if TFLITE_HAS_OV5647
+  if (gray_lib == nullptr && s_active_camera == CAMERA_TYPE_OV5647) {
+    gray_lib = esp32_p4_ov5647_gray();
+  }
+#endif
+  if (gray_lib == nullptr) return nullptr;
+  int src_w = CameraGetRgbWidth();
+  if (src_w == OUT_WIDTH) return gray_lib;
+  // Nearest-neighbour downsample (OV5647 library side > IMG_SIZE).
+  for (int y = 0; y < OUT_HEIGHT; y++) {
+    int src_y = (int)((int64_t)y * src_w / OUT_WIDTH);
+    for (int x = 0; x < OUT_WIDTH; x++) {
+      int src_x = (int)((int64_t)x * src_w / OUT_WIDTH);
+      buf[y * OUT_WIDTH + x] = gray_lib[src_y * src_w + src_x];
+    }
+  }
+  return buf;
+}
+
 // Begin-once guard shared by GetImage and the capture modes in TFLite.ino.
 // The IMX219/OV5647 library begin() is NOT re-entrant: calling it a second
 // time (e.g. when a runtime mode switch re-inits a capture mode) re-runs the

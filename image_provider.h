@@ -192,6 +192,7 @@ void CameraSendRgbToSerialWb(uint16_t wb_red, uint16_t wb_blue);
 // passthrough).  Use in capture modes — the library buffer is 160×160 for
 // OV5647 and streaming its first bytes row-major tears the frame.
 const uint8_t* CameraGetRgbImgSized();
+const uint8_t* CameraGetGrayImgSized();
 
 // ── TFLite interface ──────────────────────────────────────────────────
 // Returns an IMG_SIZE×IMG_SIZE grayscale image.

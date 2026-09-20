@@ -1395,20 +1395,23 @@ static void inference_task(void *arg) {
 
     if (mode == OpMode::kInferGray) {
       if (!s_infergray_banner) {
-        Serial.printf("INFER_GRAY: stream sync=AA 55 AA + %dx%dx1 GRAY8 (model input) — UART→S3 still active\r\n",
+        Serial.printf("INFER_GRAY: stream sync=AA 55 AA + %dx%dx1 GRAY8 (raw library gray, uncropped) — UART→S3 still active\r\n",
                       IMG_SIZE, IMG_SIZE);
         Serial.flush();
         s_infergray_banner = true;
       }
-      // Same wire format as kCaptureGray: AA 55 AA + 96×96×1 GRAY8.
-      static uint8_t gray[IMG_SIZE * IMG_SIZE];
-      for (size_t i = 0; i < (size_t)IMG_SIZE * (size_t)IMG_SIZE; i++) {
-        gray[i] = (uint8_t)((int)input_snapshot[i] + 128);
+      // RAW library gray — the same source the IMX219_Grayscale_Serial
+      // data-collection stream (training data) uses: uncropped, BT.601, no
+      // contrast stretch, library orientation.  Previously this sent the
+      // model-input tensor, which is already MCU-cropped by the search box
+      // (and mis-oriented vs the gray stream).
+      const uint8_t *gray_raw = CameraGetGrayImgSized();
+      if (gray_raw != nullptr) {
+        static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
+        Serial.write(sync, 3);
+        Serial.write(gray_raw, (size_t)IMG_SIZE * (size_t)IMG_SIZE);
+        Serial.flush();
       }
-      static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
-      Serial.write(sync, 3);
-      Serial.write(gray, sizeof(gray));
-      Serial.flush();
     }
 
     uint64_t t_invoke_start = esp_timer_get_time();
