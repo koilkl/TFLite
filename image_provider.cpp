@@ -929,6 +929,16 @@ static double py_round_d(double x) {
 }
 static long py_round_l(double x) { return (long)py_round_d(x); }
 
+static int hist_value_at_rank(const uint32_t *hist, int total, long rank) {
+  // Value at a given rank = the bin whose CDF first reaches rank+1.
+  uint32_t cdf = 0;
+  for (int i = 0; i < 256; i++) {
+    cdf += hist[i];
+    if (cdf >= (uint32_t)(rank + 1)) return i;
+  }
+  return 255;
+}
+
 static int percentile_from_hist(const uint32_t *hist, int total, double q) {
   // Mirrors numpy.percentile(..., method='linear', the default):
   //   pos = (total - 1) * q
@@ -942,17 +952,8 @@ static int percentile_from_hist(const uint32_t *hist, int total, double q) {
   if (lo_rank > total - 1) lo_rank = total - 1;
   if (hi_rank < 0) hi_rank = 0;
   if (hi_rank > total - 1) hi_rank = total - 1;
-  // value at a given rank = the bin whose CDF first reaches rank+1
-  int v_at(long rank) {
-    uint32_t cdf = 0;
-    for (int i = 0; i < 256; i++) {
-      cdf += hist[i];
-      if (cdf >= (uint32_t)(rank + 1)) return i;
-    }
-    return 255;
-  }
-  int v_lo = v_at(lo_rank);
-  int v_hi = v_at(hi_rank);
+  int v_lo = hist_value_at_rank(hist, total, lo_rank);
+  int v_hi = hist_value_at_rank(hist, total, hi_rank);
   double frac = pos - (double)lo_rank;
   double v = (double)v_lo + frac * (double)(v_hi - v_lo);
   return (int)v;
