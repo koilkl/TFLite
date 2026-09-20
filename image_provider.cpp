@@ -171,6 +171,28 @@ static const char *camera_type_name(int t) {
   return "UNKNOWN";
 }
 
+// Unified camera API: the USER CONFIG values (FRAME_SIDE / CAMERA_FLIP_180
+// from the top of TFLite.ino) are pushed into whichever camera is active.
+// Called from setup() BEFORE any capture or inference path runs.
+void ImageProviderConfigureCamera(int frame_side, bool flip_180) {
+#if CAMERA_TYPE == CAMERA_TYPE_AUTO
+  if (s_active_camera == CAMERA_TYPE_AUTO) {
+    s_active_camera = detect_camera_type();
+  }
+#endif
+  if (s_active_camera == CAMERA_TYPE_IMX219) {
+#if TFLITE_HAS_IMX219
+    esp32_p4_imx219_set_frame_side(frame_side);   // set BEFORE begin
+    esp32_p4_imx219_set_flip_180(flip_180);
+#endif
+  } else if (s_active_camera == CAMERA_TYPE_OV5647) {
+#if TFLITE_HAS_OV5647
+    esp32_p4_ov5647_set_frame_side(frame_side);
+    esp32_p4_ov5647_set_flip_180(flip_180);
+#endif
+  }
+}
+
 bool CameraBegin() {
 #if CAMERA_TYPE == CAMERA_TYPE_AUTO
   s_active_camera = detect_camera_type();
@@ -178,20 +200,11 @@ bool CameraBegin() {
   bool ok = false;
   if (s_active_camera == CAMERA_TYPE_IMX219) {
 #if TFLITE_HAS_IMX219
-    // Unified camera API: IMG_SIZE is the single knob — the library's
-    // runtime frame side follows it (set BEFORE begin so buffers/LUTs are
-    // sized right), and the 180° flip matches the data-collection
-    // sketches (the camera is mounted upside down; training data is
-    // right-side up).
-    esp32_p4_imx219_set_frame_side(IMG_SIZE);
     ok = esp32_p4_imx219_begin();
-    if (ok) esp32_p4_imx219_set_flip_180(CAMERA_FLIP_180);
 #endif
   } else if (s_active_camera == CAMERA_TYPE_OV5647) {
 #if TFLITE_HAS_OV5647
-    esp32_p4_ov5647_set_frame_side(IMG_SIZE);
     ok = esp32_p4_ov5647_begin();
-    if (ok) esp32_p4_ov5647_set_flip_180(CAMERA_FLIP_180);
 #endif
   }
   return ok;
@@ -305,7 +318,8 @@ const uint8_t* CameraGetRgbImgSized() {
 // frames matching the training distribution (the old path sent the
 // model-input tensor: already MCU-cropped by the search box).
 const uint8_t* CameraGetGrayImgSized() {
-  static uint8_t buf[OUT_WIDTH * OUT_HEIGHT];
+  // The library output is already FRAME_SIDE-sized (unified API,
+  // ImageProviderConfigureCamera in setup) — return it directly.
   const uint8_t* gray_lib = nullptr;
   if (s_active_camera == CAMERA_TYPE_IMX219) {
 #if TFLITE_HAS_IMX219
@@ -317,18 +331,7 @@ const uint8_t* CameraGetGrayImgSized() {
     gray_lib = esp32_p4_ov5647_gray();
   }
 #endif
-  if (gray_lib == nullptr) return nullptr;
-  int src_w = CameraGetRgbWidth();
-  if (src_w == OUT_WIDTH) return gray_lib;
-  // Nearest-neighbour downsample (OV5647 library side > IMG_SIZE).
-  for (int y = 0; y < OUT_HEIGHT; y++) {
-    int src_y = (int)((int64_t)y * src_w / OUT_WIDTH);
-    for (int x = 0; x < OUT_WIDTH; x++) {
-      int src_x = (int)((int64_t)x * src_w / OUT_WIDTH);
-      buf[y * OUT_WIDTH + x] = gray_lib[src_y * src_w + src_x];
-    }
-  }
-  return buf;
+  return gray_lib;
 }
 
 // Begin-once guard shared by GetImage and the capture modes in TFLite.ino.

@@ -6,29 +6,29 @@ Out-of-distribution (OOD) rejection is built in: empty scenes / overexposed fram
 
 ## User Config (the two knobs you edit)
 
-Edit **`user_config.h`** (next to `TFLite.ino` — the .ino top has a pointer banner):
+Edit the **top of `TFLite.ino`** — the `USER CONFIG` block:
 
 ```cpp
-#define IMG_SIZE          96     // resolution: model input AND capture streams
+#define FRAME_SIDE        96     // capture / serial-stream resolution (8-512)
 #define CAMERA_FLIP_180   true   // camera is mounted upside down → rotate 180°
 ```
 
-- **`IMG_SIZE`** — one knob for everything: the camera libraries follow it at
-  runtime (`set_frame_side(IMG_SIZE)` in `CameraBegin`, unified API shared by
-  both camera libraries), so the model input and the capture/serial streams
-  all change together.  Couplings when you change it:
-  1. Export the model from **AItraining with the same `img_size`** and
-     regenerate `tm_model_data.cpp` (or reflash the exported model);
-  2. Set the same value in AItraining **device settings → Image Size**;
-  3. Reflash this sketch.  A FATAL check at startup refuses to run when the
-     model's input size ≠ `IMG_SIZE` (fail loudly, never corrupt memory).
+- **`FRAME_SIDE`** — capture and serial-stream resolution.  The camera
+  libraries follow it at runtime (`ImageProviderConfigureCamera()` in
+  `setup()`, unified API shared by both camera libraries).  Set the same
+  value in AItraining **device settings → Image Size** and reflash.
 - **`CAMERA_FLIP_180`** — the sensor is mounted upside down on the board; the
   flip aligns all streams with the data-collection (training) orientation.
   Set `false` only if your mount differs.
+- The **model input size** is separate: `IMG_SIZE` in `image_provider.h`
+  (must match the exported model — AItraining `img_size`).  To change it,
+  re-export the model at that size, update the header, and reflash.  A
+  FATAL check at startup refuses to run when the model's input size ≠
+  `IMG_SIZE` (fail loudly, never corrupt memory).
 
-> Why a separate header: each Arduino `.cpp` compiles independently, so a
-> `#define` at the top of `TFLite.ino` cannot reach `image_provider.cpp`.
-> `user_config.h` is included by both, so editing it once is global.
+The same variable names (`g_frame_side` / `g_flip_180`) appear in both
+camera-library example sketches, so the pattern is consistent across the
+three codebases.
 
 ## Camera Selection
 
@@ -38,8 +38,8 @@ Edit `image_provider.h`:
 #define CAMERA_TYPE CAMERA_TYPE_IMX219   // or CAMERA_TYPE_OV5647 / CAMERA_TYPE_AUTO
 ```
 
-- **IMX219**: MIPI CSI, 1536×1232 RAW10. Output side follows `IMG_SIZE` from `user_config.h` (runtime, unified API).
-- **OV5647**: MIPI CSI, 1920×1080 RAW10. Output side follows `IMG_SIZE` from `user_config.h` (runtime, unified API — the library no longer has its own fixed 160×160).
+- **IMX219**: MIPI CSI, 1536×1232 RAW10. Output side follows `FRAME_SIDE` from the TFLite.ino USER CONFIG block (runtime, unified API).
+- **OV5647**: MIPI CSI, 1920×1080 RAW10. Output side follows `FRAME_SIDE` from the TFLite.ino USER CONFIG block (runtime, unified API — the library no longer has its own fixed 160×160).
 - **AUTO**: probes the shared I2C bus at startup (IMX219=0x10, OV5647=0x36) and picks whichever responds — no recompile needed when swapping cameras.
 
 Both cameras feed the same pipeline, so switching cameras only requires changing `CAMERA_TYPE`.

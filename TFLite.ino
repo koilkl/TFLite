@@ -12,13 +12,24 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-==============================================================================*/
 
 // ═══════════════════════════════════════════════════════════════════════
-// USER CONFIG — to change resolution / rotation, edit the two values in
-//              user_config.h next to this file (IMG_SIZE + CAMERA_FLIP_180)
+// USER CONFIG — edit these two values only (edit HERE, in this file)
+//
+//   FRAME_SIDE
+//     Capture / serial-stream resolution (8-512).  The camera libraries
+//     follow it at runtime (unified API, applied in setup()).  The MODEL
+//     INPUT stays at the exported model size (image_provider.h IMG_SIZE);
+//     to change the model input size, re-export the model from AItraining
+//     at that img_size and update image_provider.h to match.
+//
+//   CAMERA_FLIP_180
+//     The camera is mounted upside down on the board; the library rotates
+//     the image 180° to match the data-collection (training) orientation.
+//     Set to false only if your mount differs.
 // ═══════════════════════════════════════════════════════════════════════
-#include "user_config.h"
+#define FRAME_SIDE        96
+#define CAMERA_FLIP_180   true
 
 // #include <TensorFlowLite.h>
 
@@ -29,13 +40,6 @@ limitations under the License.
 // Rename this include to match your exported model's header file name,
 // e.g. "Square_model_data.h" or "MyModel_model_data.h".
 #include "tm_model_data.h"
-
-// ── Camera capture resolution — change THIS line only ──
-// Students: set the frame side you want (8-512).  The camera library reads
-// this at runtime; GetImage() auto-resizes the capture down to the model
-// input size (OUT_WIDTH×OUT_HEIGHT = 96×96), so no header/library edits are
-// needed — only re-train/re-export if you change the MODEL input size.
-int g_imx219_frame_side = 96;
 
 
 #include "tensorflow/lite/micro/micro_log.h"
@@ -1182,7 +1186,7 @@ static void inference_task(void *arg) {
       }
       if (!s_caprgb_banner) {
         Serial.printf("CAPTURE_RGB/plain: stream sync=AA 55 AA + %dx%dx3 (AItraining)\r\n",
-                      IMG_SIZE, IMG_SIZE);
+                      FRAME_SIDE, FRAME_SIDE);
         Serial.flush();
         s_caprgb_banner = true;
       }
@@ -1194,10 +1198,10 @@ static void inference_task(void *arg) {
       if (!got_frame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
       frame_id++;
 
-      // IMG_SIZE-sized copy (OV5647's 160×160 library buffer must be
-      // resized first — streaming its raw prefix tears the frame).
-      const uint8_t *rgb = CameraGetRgbImgSized();
-      const size_t bytes = (size_t)IMG_SIZE * (size_t)IMG_SIZE * 3;
+      // The library output is already FRAME_SIDE-sized (unified API,
+      // ImageProviderConfigureCamera in setup) — stream it directly.
+      const uint8_t *rgb = CameraGetRgb();
+      const size_t bytes = CameraGetRgbSize();
 
       static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
       Serial.write(sync, 3);
@@ -1284,14 +1288,14 @@ static void inference_task(void *arg) {
       }
       if (!got_frame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
       frame_id++;
-      const uint8_t *rgb = CameraGetRgbImgSized();  // IMG_SIZE-sized copy (see kCaptureRgb)
-      const size_t bytes = (size_t)IMG_SIZE * (size_t)IMG_SIZE * 3;
+      const uint8_t *rgb = CameraGetRgb();  // FRAME_SIDE-sized library output
+      const size_t bytes = CameraGetRgbSize();
       uint8_t hdr[3 + 1 + 2 + 2 + 2];
       hdr[0] = kCapSync0;  hdr[1] = kCapSync1;  hdr[2] = kCapExtSync2;
       hdr[3] = kCapKindRgb;
       write_u16_le(hdr + 4, frame_id);
-      write_u16_le(hdr + 6, (uint16_t)IMG_SIZE);
-      write_u16_le(hdr + 8, (uint16_t)IMG_SIZE);
+      write_u16_le(hdr + 6, (uint16_t)FRAME_SIDE);
+      write_u16_le(hdr + 8, (uint16_t)FRAME_SIDE);
       uint8_t x = debug_xor(hdr, sizeof(hdr));
       Serial.write(hdr, sizeof(hdr));
       for (size_t i = 0; i < bytes; i++) x ^= rgb[i];
@@ -1308,7 +1312,7 @@ static void inference_task(void *arg) {
     if (mode == OpMode::kExtCaptureGray) {
       if (!input || !interpreter) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
       if (!s_extgray_banner) {
-        Serial.printf("CAPTURE_GRAY/extended: stream sync=AA 55 AB + kind/fid/w/h + GRAY8 + xor8\r\n");
+        Serial.printf("CAPTURE_GRAY/extended: stream sync=AA 55 AB + kind/fid/w/h + GRAY8 (tensor input) + xor8\r\n");
         Serial.flush();
         s_extgray_banner = true;
       }
@@ -1363,7 +1367,7 @@ static void inference_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         continue;
       }
-      Serial.printf("RGB stream mode: 0xAA 0x55 0xAA + %dx%dx3\n", IMG_SIZE, IMG_SIZE);
+      Serial.printf("RGB stream mode: 0xAA 0x55 0xAA + %dx%dx3\n", FRAME_SIDE, FRAME_SIDE);
     }
     for (int tries = 0; tries < 100; tries++) {
       if (CameraUpdate()) {
@@ -1403,7 +1407,7 @@ static void inference_task(void *arg) {
     if (mode == OpMode::kInferGray) {
       if (!s_infergray_banner) {
         Serial.printf("INFER_GRAY: stream sync=AA 55 AA + %dx%dx1 GRAY8 (raw library gray, uncropped) — UART→S3 still active\r\n",
-                      IMG_SIZE, IMG_SIZE);
+                      FRAME_SIDE, FRAME_SIDE);
         Serial.flush();
         s_infergray_banner = true;
       }
@@ -1416,7 +1420,7 @@ static void inference_task(void *arg) {
       if (gray_raw != nullptr) {
         static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
         Serial.write(sync, 3);
-        Serial.write(gray_raw, (size_t)IMG_SIZE * (size_t)IMG_SIZE);
+        Serial.write(gray_raw, (size_t)FRAME_SIDE * (size_t)FRAME_SIDE);
         Serial.flush();
       }
     }
@@ -1602,6 +1606,12 @@ void setup() {
   Serial.begin(kDebugBaud);
   delay(100);
   Serial.println("P4 TFLite start");
+
+  // USER CONFIG (top of this file): push FRAME_SIDE + CAMERA_FLIP_180 into
+  // the camera library before any capture/inference code runs.
+  ImageProviderConfigureCamera(FRAME_SIDE, CAMERA_FLIP_180);
+  Serial.printf("Camera config: FRAME_SIDE=%d FLIP_180=%d\r\n",
+                (int)FRAME_SIDE, (int)CAMERA_FLIP_180);
 #if PREPROCESS_MODE == PREPROCESS_MODE_BG
   Serial.printf("Preprocess: B-G  | Camera: %s\n", CameraGetName());
 #elif PREPROCESS_MODE == PREPROCESS_MODE_GRAY

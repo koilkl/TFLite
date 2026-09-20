@@ -139,13 +139,11 @@
 // Crop mode: sign ROI.  Junction mode was removed.
 #define CROP_MODE_SIGN     0
 
-// ── USER CONFIG — edit user_config.h (next to TFLite.ino) ─────────────
-// IMG_SIZE + CAMERA_FLIP_180 live in user_config.h so every compilation
-// unit sees the same values.  IMG_SIZE drives the MODEL INPUT and the
-// capture/serial streams — the camera libraries follow it at runtime
-// (unified API: set_frame_side(IMG_SIZE) in CameraBegin).  The TFLite
-// model must be exported at the SAME size from AItraining (img_size).
-#include "user_config.h"
+// ── IMG_SIZE: MODEL INPUT resolution (not the capture side) ───────────
+// Must match the exported model (AItraining img_size).  The CAPTURE /
+// serial-stream resolution is FRAME_SIDE, configured at the top of
+// TFLite.ino and pushed to the camera library at runtime via
+// ImageProviderConfigureCamera() (unified camera API).
 
 // Constants from main.ino
 #define IMG_WIDTH  1536
@@ -188,6 +186,10 @@ void CameraSendRgbToSerialWb(uint16_t wb_red, uint16_t wb_blue);
 // OV5647 and streaming its first bytes row-major tears the frame.
 const uint8_t* CameraGetRgbImgSized();
 const uint8_t* CameraGetGrayImgSized();
+
+// Apply the TFLite.ino USER CONFIG (FRAME_SIDE / CAMERA_FLIP_180) to the
+// active camera.  Call once in setup() before any capture/inference.
+void ImageProviderConfigureCamera(int frame_side, bool flip_180);
 
 // ── TFLite interface ──────────────────────────────────────────────────
 // Returns an IMG_SIZE×IMG_SIZE grayscale image.
