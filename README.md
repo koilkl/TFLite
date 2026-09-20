@@ -4,6 +4,32 @@ On-device sign inference for ESP32-P4 with TensorFlow Lite Micro. Captures frame
 
 Out-of-distribution (OOD) rejection is built in: empty scenes / overexposed frames / no-sign inputs are signalled via the UART/SD `flags` byte so receivers never trust a softmax-hallucinated high-confidence label. See **OOD (No Sign) Signalling** below.
 
+## User Config (the two knobs you edit)
+
+Edit **`user_config.h`** (next to `TFLite.ino` — the .ino top has a pointer banner):
+
+```cpp
+#define IMG_SIZE          96     // resolution: model input AND capture streams
+#define CAMERA_FLIP_180   true   // camera is mounted upside down → rotate 180°
+```
+
+- **`IMG_SIZE`** — one knob for everything: the camera libraries follow it at
+  runtime (`set_frame_side(IMG_SIZE)` in `CameraBegin`, unified API shared by
+  both camera libraries), so the model input and the capture/serial streams
+  all change together.  Couplings when you change it:
+  1. Export the model from **AItraining with the same `img_size`** and
+     regenerate `tm_model_data.cpp` (or reflash the exported model);
+  2. Set the same value in AItraining **device settings → Image Size**;
+  3. Reflash this sketch.  A FATAL check at startup refuses to run when the
+     model's input size ≠ `IMG_SIZE` (fail loudly, never corrupt memory).
+- **`CAMERA_FLIP_180`** — the sensor is mounted upside down on the board; the
+  flip aligns all streams with the data-collection (training) orientation.
+  Set `false` only if your mount differs.
+
+> Why a separate header: each Arduino `.cpp` compiles independently, so a
+> `#define` at the top of `TFLite.ino` cannot reach `image_provider.cpp`.
+> `user_config.h` is included by both, so editing it once is global.
+
 ## Camera Selection
 
 Edit `image_provider.h`:
@@ -12,8 +38,8 @@ Edit `image_provider.h`:
 #define CAMERA_TYPE CAMERA_TYPE_IMX219   // or CAMERA_TYPE_OV5647 / CAMERA_TYPE_AUTO
 ```
 
-- **IMX219**: MIPI CSI, 1536×1232 RAW10. Library builds at `IMG_SIZE` (96×96 default) via the override in `image_provider.h`.
-- **OV5647**: MIPI CSI, 1920×1080 RAW10. The library stays at its own 160×160 default — `GetImage()` resizes to `IMG_SIZE` at runtime.
+- **IMX219**: MIPI CSI, 1536×1232 RAW10. Output side follows `IMG_SIZE` from `user_config.h` (runtime, unified API).
+- **OV5647**: MIPI CSI, 1920×1080 RAW10. Output side follows `IMG_SIZE` from `user_config.h` (runtime, unified API — the library no longer has its own fixed 160×160).
 - **AUTO**: probes the shared I2C bus at startup (IMX219=0x10, OV5647=0x36) and picks whichever responds — no recompile needed when swapping cameras.
 
 Both cameras feed the same pipeline, so switching cameras only requires changing `CAMERA_TYPE`.

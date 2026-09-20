@@ -12,6 +12,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+==============================================================================*/
+
+// ═══════════════════════════════════════════════════════════════════════
+// USER CONFIG — 改分辨率 / 旋转方向,打开同目录的 user_config.h 改两个值
+//             (IMG_SIZE 和 CAMERA_FLIP_180 都在那里,注释齐全)
+// ═══════════════════════════════════════════════════════════════════════
+#include "user_config.h"
 
 // #include <TensorFlowLite.h>
 

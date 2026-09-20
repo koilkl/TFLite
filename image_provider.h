@@ -139,25 +139,13 @@
 // Crop mode: sign ROI.  Junction mode was removed.
 #define CROP_MODE_SIGN     0
 
-// ── USER CONFIG — the only knobs to edit ─────────────────────────────
-// IMG_SIZE: pipeline resolution (default 96).  It drives the MODEL INPUT
-// and the capture/serial streams — the camera libraries follow it at
-// runtime (unified API: set_frame_side(IMG_SIZE) in CameraBegin).  The
-// TFLite model must be exported at the SAME size from AItraining
-// (img_size) — change both and reflash.
-// Override by defining before including this header, e.g. in the .ino:
-//     #define IMG_SIZE 160
-//     #include "image_provider.h"
-#ifndef IMG_SIZE
-#define IMG_SIZE 96
-#endif
-
-// CAMERA_FLIP_180: the camera is mounted upside down on the board, so all
-// streams rotate 180° to match the data-collection (training) orientation.
-// Set false only if your mount differs.
-#ifndef CAMERA_FLIP_180
-#define CAMERA_FLIP_180 true
-#endif
+// ── USER CONFIG — edit user_config.h (next to TFLite.ino) ─────────────
+// IMG_SIZE + CAMERA_FLIP_180 live in user_config.h so every compilation
+// unit sees the same values.  IMG_SIZE drives the MODEL INPUT and the
+// capture/serial streams — the camera libraries follow it at runtime
+// (unified API: set_frame_side(IMG_SIZE) in CameraBegin).  The TFLite
+// model must be exported at the SAME size from AItraining (img_size).
+#include "user_config.h"
 
 // Constants from main.ino
 #define IMG_WIDTH  1536
