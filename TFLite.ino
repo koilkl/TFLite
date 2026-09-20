@@ -1736,6 +1736,24 @@ void setup() {
   // Get information about the memory area to use for the model's input.
   input = interpreter->input(0);
 
+  // ── Fool-proofing: model input size MUST match IMG_SIZE ─────────────
+  // The model's input dims are baked in at export time.  If IMG_SIZE is
+  // changed without re-exporting the model at that size, GetImage would
+  // write IMG_SIZE² bytes into a smaller tensor and corrupt the arena —
+  // fail loudly with a clear message instead.
+  if (input->dims->size < 3 ||
+      (int)input->dims->data[1] != IMG_SIZE ||
+      (int)input->dims->data[2] != IMG_SIZE) {
+    Serial.printf(
+        "FATAL: model input is %dx%d but IMG_SIZE=%d.\r\n"
+        "       Re-export the model in AItraining with img_size=%d and reflash,\r\n"
+        "       or set IMG_SIZE back to %d in image_provider.h.\r\n",
+        (int)input->dims->data[1], (int)input->dims->data[2], (int)IMG_SIZE,
+        (int)IMG_SIZE, (int)input->dims->data[1]);
+    Serial.flush();
+    for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+  }
+
   // --- Diagnostics ---
   Serial.print("Arena used: ");
   Serial.print(interpreter->arena_used_bytes());
