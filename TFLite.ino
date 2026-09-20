@@ -15,8 +15,8 @@ limitations under the License.
 ==============================================================================*/
 
 // ═══════════════════════════════════════════════════════════════════════
-// USER CONFIG — 改分辨率 / 旋转方向,打开同目录的 user_config.h 改两个值
-//             (IMG_SIZE 和 CAMERA_FLIP_180 都在那里,注释齐全)
+// USER CONFIG — to change resolution / rotation, edit the two values in
+//              user_config.h next to this file (IMG_SIZE + CAMERA_FLIP_180)
 // ═══════════════════════════════════════════════════════════════════════
 #include "user_config.h"
 
@@ -160,11 +160,11 @@ static constexpr uint8_t kCmdPing             = 0x7F;   // → ack len=0
 // Operation mode (runtime switchable via Debug Serial)
 enum class OpMode : uint8_t {
   kInference = 0,   // default: full pipeline → UART / SD / periodic log
-  kCaptureRgb= 1,   // PLAIN: AA 55 AA + 96×96×3 RGB, AItraining capture panel 能用
-  kCaptureGray= 2,  // PLAIN: AA 55 AA + 96×96×1 GRAY, AItraining 预览/采集 能用
+  kCaptureRgb= 1,   // PLAIN: AA 55 AA + 96×96×3 RGB, works with the AItraining capture panel
+  kCaptureGray= 2,  // PLAIN: AA 55 AA + 96×96×1 GRAY, works with AItraining preview/capture
   kInferGray  = 3,  // infer + stream GRAY on Serial (S3 UART still active), no logs
-  kExtCaptureRgb =11,// EXTENDED: AA 55 AB + kind/fid/w/h + pixels + xor（脚本工具用）
-  kExtCaptureGray=12 // EXTENDED: 同上 GRAY8
+  kExtCaptureRgb =11,// EXTENDED: AA 55 AB + kind/fid/w/h + pixels + xor (scripting tools)
+  kExtCaptureGray=12 // EXTENDED: same as above, GRAY8
 };
 static volatile OpMode s_op_mode = OpMode::kInference;
 
@@ -1256,10 +1256,10 @@ static void inference_task(void *arg) {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Extended mode kExtCaptureRgb — 脚本工具专用，带 metadata + checksum。
+    // Extended mode kExtCaptureRgb — for scripting tools, with metadata + checksum.
     // Wire: AA 55 AB  kind(1)  fid_LE(2)  w_LE(2)  h_LE(2)  <RGB bytes>  xor8
-    // kind=0x01=RGB24, xor8 覆盖 header + pixel 部分，不包含 checksum byte。
-    // 学生/默认 AItraining 不需要用这个模式。
+    // kind=0x01=RGB24; xor8 covers the header + pixel bytes (checksum byte excluded).
+    // Not needed for the default AItraining workflow.
     // ─────────────────────────────────────────────────────────
     if (mode == OpMode::kExtCaptureRgb) {
       if (!s_extrgb_ready) {
@@ -1303,7 +1303,7 @@ static void inference_task(void *arg) {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Extended mode kExtCaptureGray — 同上 GRAY8。
+    // Extended mode kExtCaptureGray — same as above, GRAY8.
     // ─────────────────────────────────────────────────────────
     if (mode == OpMode::kExtCaptureGray) {
       if (!input || !interpreter) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
