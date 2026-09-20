@@ -169,10 +169,10 @@ static constexpr uint8_t kCmdPing             = 0x7F;   // → ack len=0
 enum class OpMode : uint8_t {
   kInference = 0,   // default: full pipeline → UART / SD / periodic log
   kCaptureRgb= 1,   // PLAIN: AA 55 AA + 96×96×3 RGB, works with the AItraining capture panel
-  kCaptureGray= 2,  // PLAIN: AA 55 AA + 96×96×1 GRAY, works with AItraining preview/capture
+  kCaptureGray= 2,  // PLAIN: AA 55 AA + g_frame_side² GRAY8 (raw, uncropped)
   kInferGray  = 3,  // infer + stream GRAY on Serial (S3 UART still active), no logs
   kExtCaptureRgb =11,// EXTENDED: AA 55 AB + kind/fid/w/h + pixels + xor (scripting tools)
-  kExtCaptureGray=12 // EXTENDED: same as above, GRAY8
+  kExtCaptureGray=12 // EXTENDED: same as above, raw GRAY8
 };
 static volatile OpMode s_op_mode = OpMode::kInference;
 
@@ -1217,48 +1217,28 @@ static void inference_task(void *arg) {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Plain mode kCaptureGray — AItraining "upper" 96×96 grayscale default.
-    // Wire: AA 55 AA  +  96×96×1 GRAY8  (int8 tensor + 128 → uint8)
-    // Matches AItraining's SerialFrameReader default sync + channels=1
-    // exactly → live serial preview / source capture work out of the box.
+    // Plain mode kCaptureGray — AItraining grayscale capture default.
+    // Wire: AA 55 AA  +  g_frame_side×g_frame_side×1 GRAY8
+    // RAW library gray (BT.601, uncropped, no contrast stretch) — the same
+    // source the data-collection stream (training data) uses, so the host
+    // runs the full crop+stretch pipeline exactly like training.
     // ─────────────────────────────────────────────────────────
     if (mode == OpMode::kCaptureGray) {
-      if (!input || !interpreter) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
       if (!s_capgray_banner) {
-        Serial.printf("CAPTURE_GRAY/plain: stream sync=AA 55 AA + %dx%dx1 GRAY8 (AItraining tensor input)\r\n",
-                      IMG_SIZE, IMG_SIZE);
+        Serial.printf("CAPTURE_GRAY/plain: stream sync=AA 55 AA + %dx%dx1 GRAY8 (raw library gray, uncropped)\r\n",
+                      g_frame_side, g_frame_side);
         Serial.flush();
         s_capgray_banner = true;
       }
 
-      uint64_t t_capture_start = esp_timer_get_time();
-      if (kTfLiteOk != GetImage(error_reporter, OUT_WIDTH, OUT_HEIGHT, 1, input->data.int8)) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-        continue;
-      }
-      const uint64_t t_capture_us = esp_timer_get_time() - t_capture_start;
-      s_total_capture_us = clamp_timing(s_total_capture_us + t_capture_us);
+      const uint8_t *gray_raw = CameraGetGrayImgSized();
+      if (gray_raw == nullptr) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
       frame_id++;
-
-      static uint8_t gray[IMG_SIZE * IMG_SIZE];
-      for (size_t i = 0; i < (size_t)IMG_SIZE * (size_t)IMG_SIZE; i++) {
-        gray[i] = (uint8_t)((int)input->data.int8[i] + 128);
-      }
 
       static const uint8_t sync[3] = { kCapSync0, kCapSync1, kCapSync2 };  // AA 55 AA
       Serial.write(sync, 3);
-      Serial.write(gray, sizeof(gray));
+      Serial.write(gray_raw, (size_t)g_frame_side * g_frame_side);
       Serial.flush();
-
-      s_total_loop_us = clamp_timing(s_total_loop_us + (esp_timer_get_time() - t_capture_start) + t_capture_us);
-      s_timed_frames++;
-      const float sign_pct = ImageProviderLastSignPct();
-      if ((frame_id % 30) == 0 && s_timed_frames > 0) {
-        const uint32_t avg_cap = (uint32_t)(s_total_capture_us / s_timed_frames);
-        Serial.printf("CAPTURE_GRAY/plain frame=%u sign=%.1f%% avg_cap=%lums (metadata only, not sent on stream)\r\n",
-                      (unsigned)frame_id, (double)sign_pct, (unsigned long)(avg_cap/1000));
-        Serial.flush();
-      }
       taskYIELD();
       continue;
     }
@@ -1311,49 +1291,30 @@ static void inference_task(void *arg) {
     }
 
     // ─────────────────────────────────────────────────────────
-    // Extended mode kExtCaptureGray — same as above, GRAY8.
+    // Extended mode kExtCaptureGray — same as above, raw GRAY8 + metadata.
     // ─────────────────────────────────────────────────────────
     if (mode == OpMode::kExtCaptureGray) {
-      if (!input || !interpreter) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
       if (!s_extgray_banner) {
-        Serial.printf("CAPTURE_GRAY/extended: stream sync=AA 55 AB + kind/fid/w/h + GRAY8 (tensor input) + xor8\r\n");
+        Serial.printf("CAPTURE_GRAY/extended: stream sync=AA 55 AB + kind/fid/w/h + GRAY8 (raw) + xor8\r\n");
         Serial.flush();
         s_extgray_banner = true;
       }
-      const uint64_t t_capture_start = esp_timer_get_time();
-      if (kTfLiteOk != GetImage(error_reporter, OUT_WIDTH, OUT_HEIGHT, 1, input->data.int8)) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-        continue;
-      }
-      const uint64_t t_capture_us = esp_timer_get_time() - t_capture_start;
-      s_total_capture_us = clamp_timing(s_total_capture_us + t_capture_us);
+      const uint8_t *gray_raw = CameraGetGrayImgSized();
+      if (gray_raw == nullptr) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
       frame_id++;
-      static uint8_t gray[IMG_SIZE * IMG_SIZE];
-      for (size_t i = 0; i < (size_t)IMG_SIZE * (size_t)IMG_SIZE; i++) {
-        gray[i] = (uint8_t)((int)input->data.int8[i] + 128);
-      }
       uint8_t hdr[3 + 1 + 2 + 2 + 2];
       hdr[0] = kCapSync0;  hdr[1] = kCapSync1;  hdr[2] = kCapExtSync2;
       hdr[3] = kCapKindGray;
       write_u16_le(hdr + 4, frame_id);
-      write_u16_le(hdr + 6, (uint16_t)IMG_SIZE);
-      write_u16_le(hdr + 8, (uint16_t)IMG_SIZE);
+      write_u16_le(hdr + 6, (uint16_t)g_frame_side);
+      write_u16_le(hdr + 8, (uint16_t)g_frame_side);
       uint8_t x = debug_xor(hdr, sizeof(hdr));
       Serial.write(hdr, sizeof(hdr));
-      const size_t bytes = sizeof(gray);
-      for (size_t i = 0; i < bytes; i++) x ^= gray[i];
-      Serial.write(gray, bytes);
+      const size_t bytes = (size_t)g_frame_side * g_frame_side;
+      for (size_t i = 0; i < bytes; i++) x ^= gray_raw[i];
+      Serial.write(gray_raw, bytes);
       Serial.write(x);
       Serial.flush();
-      s_total_loop_us = clamp_timing(s_total_loop_us + (esp_timer_get_time() - t_capture_start) + t_capture_us);
-      s_timed_frames++;
-      const float sign_pct = ImageProviderLastSignPct();
-      if ((frame_id % 30) == 0 && s_timed_frames > 0) {
-        const uint32_t avg_cap = (uint32_t)(s_total_capture_us / s_timed_frames);
-        Serial.printf("CAPTURE_GRAY/extended frame=%u sign=%.1f%% avg_cap=%lums\r\n",
-                      (unsigned)frame_id, (double)sign_pct, (unsigned long)(avg_cap/1000));
-        Serial.flush();
-      }
       taskYIELD();
       continue;
     }
