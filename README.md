@@ -9,15 +9,16 @@ Out-of-distribution (OOD) rejection is built in: empty scenes / overexposed fram
 Edit the **top of `TFLite.ino`** — the `USER CONFIG` block:
 
 ```cpp
-#define FRAME_SIDE        96     // capture / serial-stream resolution (8-512)
-#define CAMERA_FLIP_180   true   // camera is mounted upside down → rotate 180°
+constexpr int  g_frame_side = 96;    // capture / serial-stream resolution (8-512)
+constexpr bool g_flip_180   = true;  // camera is mounted upside down → rotate 180°
 ```
 
-- **`FRAME_SIDE`** — capture and serial-stream resolution.  The camera
-  libraries follow it at runtime (`ImageProviderConfigureCamera()` in
-  `setup()`, unified API shared by both camera libraries).  Set the same
-  value in AItraining **device settings → Image Size** and reflash.
-- **`CAMERA_FLIP_180`** — the sensor is mounted upside down on the board; the
+- **`g_frame_side`** — capture and serial-stream resolution.  Same variable
+  name as the camera-library example sketches.  The camera libraries follow
+  it at runtime (`ImageProviderConfigureCamera()` in `setup()`, unified API
+  shared by both camera libraries).  Set the same value in AItraining
+  **device settings → Image Size** and reflash.
+- **`g_flip_180`** — the sensor is mounted upside down on the board; the
   flip aligns all streams with the data-collection (training) orientation.
   Set `false` only if your mount differs.
 - The **model input size** is separate: `IMG_SIZE` in `image_provider.h`
@@ -38,7 +39,7 @@ Edit `image_provider.h`:
 #define CAMERA_TYPE CAMERA_TYPE_IMX219   // or CAMERA_TYPE_OV5647 / CAMERA_TYPE_AUTO
 ```
 
-- **IMX219**: MIPI CSI, 1536×1232 RAW10. Output side follows `FRAME_SIDE` from the TFLite.ino USER CONFIG block (runtime, unified API).
+- **IMX219**: MIPI CSI, 1536×1232 RAW10. Output side follows `g_frame_side` from the TFLite.ino USER CONFIG block (runtime, unified API).
 - **OV5647**: MIPI CSI, 1920×1080 RAW10. Output side follows `FRAME_SIDE` from the TFLite.ino USER CONFIG block (runtime, unified API — the library no longer has its own fixed 160×160).
 - **AUTO**: probes the shared I2C bus at startup (IMX219=0x10, OV5647=0x36) and picks whichever responds — no recompile needed when swapping cameras.
 
