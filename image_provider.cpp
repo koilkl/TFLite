@@ -178,16 +178,18 @@ bool CameraBegin() {
   bool ok = false;
   if (s_active_camera == CAMERA_TYPE_IMX219) {
 #if TFLITE_HAS_IMX219
+    // Unified camera API: IMG_SIZE is the single knob — the library's
+    // runtime frame side follows it (set BEFORE begin so buffers/LUTs are
+    // sized right), and the 180° flip matches the data-collection
+    // sketches (the camera is mounted upside down; training data is
+    // right-side up).
+    esp32_p4_imx219_set_frame_side(IMG_SIZE);
     ok = esp32_p4_imx219_begin();
-    // The camera is mounted upside down on the board.  The data-collection
-    // sketches enable the library's 180° flip, so the gray/rgb streams (and
-    // therefore the training data) are right-side up.  TFLite must enable
-    // the same flip or the model input — and every serial stream — is 180°
-    // rotated vs what the model was trained on.
     if (ok) esp32_p4_imx219_set_flip_180(true);
 #endif
   } else if (s_active_camera == CAMERA_TYPE_OV5647) {
 #if TFLITE_HAS_OV5647
+    esp32_p4_ov5647_set_frame_side(IMG_SIZE);
     ok = esp32_p4_ov5647_begin();
     if (ok) esp32_p4_ov5647_set_flip_180(true);
 #endif
