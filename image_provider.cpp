@@ -179,10 +179,17 @@ bool CameraBegin() {
   if (s_active_camera == CAMERA_TYPE_IMX219) {
 #if TFLITE_HAS_IMX219
     ok = esp32_p4_imx219_begin();
+    // The camera is mounted upside down on the board.  The data-collection
+    // sketches enable the library's 180° flip, so the gray/rgb streams (and
+    // therefore the training data) are right-side up.  TFLite must enable
+    // the same flip or the model input — and every serial stream — is 180°
+    // rotated vs what the model was trained on.
+    if (ok) esp32_p4_imx219_set_flip_180(true);
 #endif
   } else if (s_active_camera == CAMERA_TYPE_OV5647) {
 #if TFLITE_HAS_OV5647
     ok = esp32_p4_ov5647_begin();
+    if (ok) esp32_p4_ov5647_set_flip_180(true);
 #endif
   }
   return ok;
