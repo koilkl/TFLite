@@ -27,7 +27,7 @@
 #define CAMERA_TYPE_AUTO    3
 
 #ifndef CAMERA_TYPE
-#define CAMERA_TYPE 2
+#define CAMERA_TYPE 3
 #endif
 
 // ── Preprocessing mode ────────────────────────────────────────────────
