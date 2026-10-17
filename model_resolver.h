@@ -8,7 +8,7 @@ Derived from the exported .tflite builtin operator table.
 
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 
-using ModelOpResolver = tflite::MicroMutableOpResolver<8>;
+using ModelOpResolver = tflite::MicroMutableOpResolver<10>;
 
 inline TfLiteStatus RegisterModelOps(ModelOpResolver& resolver) {
   if (resolver.AddConv2D() != kTfLiteOk) return kTfLiteError;
@@ -19,6 +19,8 @@ inline TfLiteStatus RegisterModelOps(ModelOpResolver& resolver) {
   if (resolver.AddReshape() != kTfLiteOk) return kTfLiteError;
   if (resolver.AddFullyConnected() != kTfLiteOk) return kTfLiteError;
   if (resolver.AddSoftmax() != kTfLiteOk) return kTfLiteError;
+  if (resolver.AddRsqrt() != kTfLiteOk) return kTfLiteError;
+  if (resolver.AddReduceMax() != kTfLiteOk) return kTfLiteError;
   return kTfLiteOk;
 }
 

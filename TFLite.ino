@@ -55,6 +55,24 @@ constexpr bool g_flip_180   = true;
 #else
 #define TM_HAS_GENERATED_MODEL_RESOLVER 0
 #endif
+// ── This is the LEGACY (96x96 sign) sketch ──────────────────────────────
+// The OCR 28x28 glyph pipeline is the sibling TFLite_OCR/ sketch.  The two
+// used to share one .ino behind `#if TM_OCR_GLYPH_MODEL`; they are separate
+// now, so the export is checked here rather than selected by it.
+//
+// A legacy export stamps TM_OCR_GLYPH_MODEL 0 in its model_settings.h, and an
+// export that predates the macro defines nothing at all — both are correct
+// here and build the 96x96 pipeline they were trained for.  An OCR export or
+// a 3-character sign export is an error, because this sketch would feed its
+// 96x96 front-end into a 784-byte tensor (or, for the sign model, never run
+// the three per-slot invocations the model expects).
+#if TM_OCR_GLYPH_MODEL
+#error "TFLite is the legacy 96x96 sketch, but this model_settings.h is an OCR export (TM_OCR_GLYPH_MODEL 1) - build the TFLite_OCR sketch instead, or re-export the legacy project into TFLite/."
+#endif
+#if defined(TM_SIGN_OCR_MODEL) && TM_SIGN_OCR_MODEL
+#error "TFLite is the legacy 96x96 sketch, but this model_settings.h is a 3-character sign export (TM_SIGN_OCR_MODEL 1) - build the TFLite_Sign sketch instead."
+#endif
+
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/system_setup.h"
@@ -78,6 +96,7 @@ constexpr bool g_flip_180   = true;
 #include <SD_MMC.h>
 #include <FFat.h>
 #include <driver/gpio.h>
+#include <math.h>
 #include <errno.h>
 #include <dirent.h>
 #include <stdio.h>
@@ -238,6 +257,24 @@ static constexpr int kImageWidth = OUT_WIDTH;
 static constexpr int kImageHeight = OUT_WIDTH;
 static constexpr size_t kImageBytes = (size_t)kImageWidth * (size_t)kImageHeight;
 static constexpr size_t kSdQueueDepth = 2;
+
+// ── Model-input geometry (runtime, not compile-time) ────────────────────
+// kImageWidth/kImageHeight describe the sign input (96x96x1 = 9216 B).  The
+// SD logger and the pre-Invoke snapshot still follow the ACTUAL tensor:
+// setup() sets these from input->dims / input->bytes once AllocateTensors()
+// has run, so an export at another size is measured rather than assumed.  A PGM
+// header that disagrees with the byte count is an unreadable file, and a
+// snapshot memcpy sized for 9216 reads 8432 bytes of someone else's arena
+// (the exact moiré-garbage failure the snapshot exists to prevent).
+//
+// The buffer is sized for this pipeline's input; the copy length is whatever
+// input->bytes says (guarded at boot).
+static constexpr size_t kSnapshotBytes =
+    (size_t)IMG_SIZE * (size_t)IMG_SIZE;
+static int8_t s_input_snapshot[kSnapshotBytes];
+static size_t   s_input_bytes = kImageBytes;   // := input->bytes in setup()
+static uint16_t s_save_w = (uint16_t)kImageWidth;   // := input->dims in setup()
+static uint16_t s_save_h = (uint16_t)kImageHeight;
 static constexpr bool kEnableSdLogger = true;
 static constexpr bool kUseSdMmcCustomPins = false;
 static constexpr int kSdClkPin = -1;
@@ -403,10 +440,13 @@ static bool write_pgm(const char *path, const uint8_t *gray) {
   if (!f) {
     return false;
   }
-  fprintf(f, "P5\n%d %d\n255\n", kImageWidth, kImageHeight);
-  size_t written = fwrite(gray, 1, kImageBytes, f);
+  // Runtime geometry: s_save_w/h/bytes follow the model's input tensor
+  // (set in setup()), so an OCR run writes a readable 28x28 PGM instead of a
+  // 96x96 header over 784 bytes of data.
+  fprintf(f, "P5\n%u %u\n255\n", (unsigned)s_save_w, (unsigned)s_save_h);
+  size_t written = fwrite(gray, 1, s_input_bytes, f);
   fclose(f);
-  return written == kImageBytes;
+  return written == s_input_bytes;
 }
 
 static bool make_run_dir() {
@@ -975,10 +1015,45 @@ static inline void dump_xor_final(uint8_t running_xor, const uint8_t *p, size_t 
   Serial.flush();
 }
 
+// ── OCR N + 1: the trailing "_background" class ─────────────────────────
+// An OCR export carries N real classes plus a synthetic "_background" class
+// meaning "no glyph in this crop" — a rejection, not a character to send.
+//
+// Detected BY NAME, not by "the last index is always background": the sign
+// model in this same sketch has three real classes and no background class,
+// so a positional rule would report "No Sign" for every RIGHT.  A model
+// without the class leaves this at -1 and nothing about it changes.
+static int8_t background_class_id() {
+  static int8_t cached = -2;   // -2 = not looked up yet, -1 = no such class
+  if (cached == -2) {
+    cached = -1;
+    for (int i = 0; i < kCategoryCount; i++) {
+      const char *name = kCategoryLabels[i];
+      if (name != nullptr && strcmp(name, "_background") == 0) {
+        cached = (int8_t)i;
+        break;
+      }
+    }
+  }
+  return cached;
+}
+
+static inline bool is_background_id(uint8_t id) {
+  const int8_t bg = background_class_id();
+  return bg >= 0 && (int)id == (int)bg;
+}
+
 // Human-readable label helper.  Returns the kCategoryLabels entry for a real
 // class (id < kCategoryCount) and "No Sign" for the synthetic OOD class that
 // we emit when the 3-layer gating believes there is no sign in frame.
+//
+// The OCR background index IS < kCategoryCount, so it must be tested first —
+// otherwise the debug print and the SD/CSV log say "_background" instead of
+// the "No Sign" every receiver already understands.
 static const char* label_name(uint8_t id) {
+  if (is_background_id(id)) {
+    return "No Sign";
+  }
   if (id < (uint8_t)kCategoryCount) {
     const char *name = kCategoryLabels[id];
     return name ? name : "?";
@@ -1035,6 +1110,7 @@ static bool ood_is_in_distribution(float sign_pct, TfLiteTensor *output,
 #else
   float min_pct = 0.0f, max_pct = 0.0f, max_prob_min = 0.0f, entropy_max = 0.0f;
   ImageProviderGetOodThresholds(&min_pct, &max_pct, &max_prob_min, &entropy_max);
+
 
   // Layer 1: sign-mask prior (cheapest; use first)
   if (min_pct > 0.0f && sign_pct < min_pct) { if (out_max_prob) *out_max_prob = 0.0f; if (out_entropy_ratio) *out_entropy_ratio = 1.0f; return false; }
@@ -1113,6 +1189,7 @@ static inline void reset_accumulators() {
   s_total_loop_us    = 0;
   s_timed_frames     = 0;
 }
+
 
 static void inference_task(void *arg) {
   (void)arg;
@@ -1341,6 +1418,14 @@ static void inference_task(void *arg) {
     // ─────────────────────────────────────────────────────────
     // kInference mode (default).
     // ─────────────────────────────────────────────────────────
+    // Both timers are stamped BEFORE the mode switch but consumed AFTER its
+    // #endif — t_capture_us and s_total_loop_us below are common code — so
+    // they must be declared out here.  Declaring them inside the #else branch
+    // left PREPROCESS_MODE == PREPROCESS_MODE_RGB referring to two identifiers
+    // that do not exist, and the RGB data-collection build did not compile.
+    uint64_t t_loop_start = esp_timer_get_time();
+
+    uint64_t t_capture_start = esp_timer_get_time();
 #if PREPROCESS_MODE == PREPROCESS_MODE_RGB
     // ── RGB data-collection mode (compile-time switch) ──
     static bool s_stream_ready = false;
@@ -1368,9 +1453,6 @@ static void inference_task(void *arg) {
       continue;
     }
 
-    uint64_t t_loop_start = esp_timer_get_time();
-
-    uint64_t t_capture_start = esp_timer_get_time();
     if (kTfLiteOk != GetImage(error_reporter, OUT_WIDTH, OUT_HEIGHT, kNumChannels, input->data.int8)) {
       vTaskDelay(pdMS_TO_TICKS(1));
       continue;
@@ -1385,8 +1467,12 @@ static void inference_task(void *arg) {
     // guaranteed valid until Invoke is called.  The kInferGray stream and
     // the SD logger must read this snapshot — reading input afterwards
     // produced deterministic moiré garbage (conv activation scratch data).
-    static int8_t input_snapshot[IMG_SIZE * IMG_SIZE];
-    memcpy(input_snapshot, input->data.int8, sizeof(input_snapshot));
+    //
+    // The copy length is the ACTUAL tensor size (input->bytes, latched into
+    // s_input_bytes at boot), never sizeof(s_input_snapshot): against a
+    // 28x28x1 OCR input a sizeof() copy reads 8432 bytes past the tensor and
+    // logs someone else's arena — the same failure mode this snapshot fixes.
+    memcpy(s_input_snapshot, input->data.int8, s_input_bytes);
 
     if (mode == OpMode::kInferGray) {
       if (!s_infergray_banner) {
@@ -1446,8 +1532,17 @@ static void inference_task(void *arg) {
     bool in_distribution = ood_is_in_distribution(sign_pct, output, &max_prob, &entropy_ratio);
     bool ood_suppressed = !in_distribution;
 
+    // ── OCR N+1: "_background" is the same "No Sign" ────────────────────
+    // The extra class means "no glyph here", so it maps onto the EXISTING
+    // high-nibble contract rather than becoming a 4th label: the S3 and every
+    // receiver already ignore label_id/confidence when (flags & 0xF0) == 0xF0.
+    // No protocol change, no S3 reflash, and downstream label tables stay N
+    // entries long.  Like OOD, label_id/confidence are left raw so the CSV
+    // still records what the model would have said.
+    const bool is_background = is_background_id(label_id);
+
     uint8_t pkt_flags = 2;  // sign_ready (junction mode removed)
-    if (ood_suppressed) {
+    if (ood_suppressed || is_background) {
       pkt_flags = (uint8_t)((pkt_flags & 0x0F) | 0xF0);  // high nibble 0xF = No Sign
     }
 
@@ -1468,7 +1563,8 @@ static void inference_task(void *arg) {
         Serial.print(cb_side); Serial.print("]");
       }
       Serial.print(" → ");
-      Serial.print(ood_suppressed ? "SUPPRESS(No Sign)" : "OK");
+      Serial.print(ood_suppressed ? "SUPPRESS(No Sign)"
+                                 : (is_background ? "BACKGROUND(No Sign)" : "OK"));
       Serial.print("  raw=[");
       for (int ri = 0; ri < kCategoryCount; ri++) {
         int raw_score = 0;
@@ -1499,8 +1595,10 @@ static void inference_task(void *arg) {
           uint8_t *dst = s_sd_buffers[buf_idx];
           // Copy from the pre-Invoke snapshot — input->data.int8 is invalid
           // after Invoke (arena reuse), it would save moiré scratch data.
-          for (size_t i = 0; i < kImageBytes; i++) {
-            dst[i] = (uint8_t)((int)input_snapshot[i] + 128);
+          // Length = the model input's byte size (784 for an OCR glyph,
+          // 9216 for the sign model); s_sd_buffers are sized for the larger.
+          for (size_t i = 0; i < s_input_bytes; i++) {
+            dst[i] = (uint8_t)((int)s_input_snapshot[i] + 128);
           }
 
           SdPacket sp;
@@ -1548,7 +1646,14 @@ static void inference_task(void *arg) {
       else                Serial.print(label_name(label_id));
       Serial.print(") conf=");
       Serial.print(confidence);
-      Serial.print(ood_suppressed ? " OOD" : " ID ");
+      // Same three-way as the per-frame debug print: "_background" becomes
+      // No Sign on the wire (flags 0xF0 above), so tagging that frame " ID "
+      // would contradict the packet this very frame just queued.  Legacy
+      // builds have no "_background" class, so is_background is always false
+      // and this line is byte-identical to the pre-OCR log.
+      if (ood_suppressed)     Serial.print(" OOD");
+      else if (is_background) Serial.print(" BG ");
+      else                    Serial.print(" ID ");
       Serial.print(" sign=");
       Serial.print(sign_pct, 1);
       Serial.print("% flags=0x");
@@ -1603,6 +1708,7 @@ void setup() {
 #elif PREPROCESS_MODE == PREPROCESS_MODE_RGB
   Serial.printf("Preprocess: RGB stream (data collection)  | Camera: %s\n", CameraGetName());
 #endif
+
 
   pinMode(kHandshakePwmPin, OUTPUT);
   analogWrite(kHandshakePwmPin, kHandshakePwmDuty);
@@ -1672,7 +1778,7 @@ void setup() {
     resolver_registered = true;
   }
   #else
-  static tflite::MicroMutableOpResolver<10> micro_op_resolver;
+  static tflite::MicroMutableOpResolver<12> micro_op_resolver;
   static bool resolver_registered = false;
   if (!resolver_registered) {
     if (micro_op_resolver.AddAveragePool2D() != kTfLiteOk) return;
@@ -1685,6 +1791,12 @@ void setup() {
     if (micro_op_resolver.AddReshape() != kTfLiteOk) return;
     if (micro_op_resolver.AddSoftmax() != kTfLiteOk) return;
     if (micro_op_resolver.AddFullyConnected() != kTfLiteOk) return;
+    // RSQRT + REDUCE_MAX: the L2-normalisation tail (x / sqrt(sum(x^2))) that
+    // the current exports end with.  Both were missing here AND from the
+    // generated model_resolver.h; the symptom is a model that flashes fine
+    // and then dies at AllocateTensors() with no mention of the op.
+    if (micro_op_resolver.AddRsqrt() != kTfLiteOk) return;
+    if (micro_op_resolver.AddReduceMax() != kTfLiteOk) return;
     resolver_registered = true;
   }
   #endif
@@ -1742,22 +1854,81 @@ void setup() {
   // Get information about the memory area to use for the model's input.
   input = interpreter->input(0);
 
-  // ── Fool-proofing: model input size MUST match IMG_SIZE ─────────────
-  // The model's input dims are baked in at export time.  If IMG_SIZE is
-  // changed without re-exporting the model at that size, GetImage would
-  // write IMG_SIZE² bytes into a smaller tensor and corrupt the arena —
-  // fail loudly with a clear message instead.
-  if (input->dims->size < 3 ||
-      (int)input->dims->data[1] != IMG_SIZE ||
-      (int)input->dims->data[2] != IMG_SIZE) {
-    Serial.printf(
-        "FATAL: model input is %dx%d but IMG_SIZE=%d.\r\n"
-        "       Re-export the model in AItraining with img_size=%d and reflash,\r\n"
-        "       or set IMG_SIZE back to %d in image_provider.h.\r\n",
-        (int)input->dims->data[1], (int)input->dims->data[2], (int)IMG_SIZE,
-        (int)IMG_SIZE, (int)input->dims->data[1]);
+  // ── Fool-proofing: the model input MUST be IMG_SIZE ──────────────────
+  // The model's input dims are baked in at export time.  If the export and
+  // this sketch disagree, the 96x96 front-end writes 9216 bytes into a
+  // smaller tensor and corrupts the arena.  Fail loudly with the one-line fix
+  // instead.
+  {
+    const int expected_side = IMG_SIZE;
+    const bool shape_bad =
+        (input->dims->size < 3) ||
+        ((int)input->dims->data[1] != expected_side) ||
+        ((int)input->dims->data[2] != expected_side);
+    if (shape_bad) {
+      const int model_h = (input->dims->size >= 3) ? (int)input->dims->data[1] : 0;
+      const int model_w = (input->dims->size >= 3) ? (int)input->dims->data[2] : 0;
+      Serial.printf(
+          "FATAL: model input is %dx%d but this build preprocesses for the legacy sign "
+          "pipeline (%dx%d).\r\n", model_h, model_w, expected_side, expected_side);
+      if (model_h == 28) {
+        // 28 is ocr_glyph.h's OCR_GLYPH_SIZE.  A wrong-export case is caught at
+        // compile time by the TM_OCR_GLYPH_MODEL guard above, so this is the
+        // remaining way to see it: a legacy project exported at img_size=28.
+        Serial.println("       28x28 is the OCR glyph canvas — build the TFLite_OCR sketch "
+                       "for that model, or re-export at the legacy size.");
+      } else {
+        Serial.printf("       Re-export the model in AItraining with img_size=%d and reflash.\r\n",
+                      expected_side);
+      }
+      Serial.flush();
+      for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
+  }
+
+  // ── Input encoder contract ───────────────────────────────────────────
+  // Both front-ends emit `int8 = gray - 128`, which is only the right
+  // encoding while the input tensor is exactly scale 1/255 / zero_point -128
+  // (what full-int8 PTQ produces from a representative dataset of
+  // glyph/255.0).  One earlier export of this same OCR pipeline came out at
+  // 235/255 — feeding the model an 8.5% brighter image with no error
+  // anywhere.  The OCR path cannot correct for it, so it refuses to run; the
+  // legacy path keeps its old behaviour but says so out loud.
+  {
+    const bool bad_type  = (input->type != kTfLiteInt8);
+    const bool bad_zp    = (input->params.zero_point != -128);
+    const bool bad_scale = (fabsf(input->params.scale - (1.0f / 255.0f)) > 1e-6f);
+    if (bad_type || bad_zp || bad_scale) {
+      Serial.printf("Input encoder mismatch: type=%d scale=%.6f zp=%d (want int8, %.6f, -128)\r\n",
+                    (int)input->type, (double)input->params.scale,
+                    (int)input->params.zero_point, 1.0 / 255.0);
+      Serial.println("WARNING: legacy path continues (its preprocessing may not match this model).");
+    }
+  }
+
+  // ── Runtime save geometry + snapshot bound ───────────────────────────
+  // The SD logger writes the model INPUT (that is what the snapshot holds),
+  // so its geometry follows the tensor: 96x96x1 = 9216 B here.  Guard the
+  // snapshot buffer first — a
+  // sizeof() copy from a smaller tensor is an arena overread, and from a
+  // larger one a stack of zeros.
+  if (input->bytes > sizeof(s_input_snapshot)) {
+    Serial.printf("FATAL: input tensor is %u bytes but the snapshot buffer is only %u — "
+                  "raise kSnapshotBytes in TFLite.ino.\r\n",
+                  (unsigned)input->bytes, (unsigned)sizeof(s_input_snapshot));
     Serial.flush();
     for (;;) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+  }
+  s_input_bytes = input->bytes;
+  s_save_w = (uint16_t)input->dims->data[1];
+  s_save_h = (uint16_t)input->dims->data[2];
+  Serial.printf("Save/snapshot geometry: %ux%u, %u bytes/frame (buffer %u)\r\n",
+                (unsigned)s_save_w, (unsigned)s_save_h,
+                (unsigned)s_input_bytes, (unsigned)sizeof(s_input_snapshot));
+
+  if (background_class_id() >= 0) {
+    Serial.printf("Note: model carries a \"_background\" class (id %d) — mapped to "
+                  "No Sign (flags 0xF0).\r\n", (int)background_class_id());
   }
 
   // --- Diagnostics ---

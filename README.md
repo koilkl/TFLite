@@ -4,6 +4,8 @@ On-device sign inference for ESP32-P4 with TensorFlow Lite Micro. Captures frame
 
 Out-of-distribution (OOD) rejection is built in: empty scenes / overexposed frames / no-sign inputs are signalled via the UART/SD `flags` byte so receivers never trust a softmax-hallucinated high-confidence label. See **OOD (No Sign) Signalling** below.
 
+A separate sketch, **`TFLite_OCR/`**, replaces this pipeline with an integer-exact OCR **glyph** front-end for character recognition projects. The UART wire format and the `flags` contract are identical in both — see **This folder is the legacy 96×96 sign sketch** below.
+
 ## User Config (the two knobs you edit)
 
 Edit the **top of `TFLite.ino`** — the `USER CONFIG` block:
@@ -17,7 +19,11 @@ constexpr bool g_flip_180   = true;  // camera is mounted upside down → rotate
   name as the camera-library example sketches.  The camera libraries follow
   it at runtime (`ImageProviderConfigureCamera()` in `setup()`, unified API
   shared by both camera libraries).  Set the same value in AItraining
-  **device settings → Image Size** and reflash.
+  **device settings → Image Size** and reflash.  This sketch's sign path has
+  no size ceiling of its own.  (The OCR sketch has one: `TFLite_OCR/` refuses
+  frames outside `side ≤ OCR_MAX_W` and `side² ≤ OCR_MAX_PIXELS` via a
+  `static_assert`, so a too-large value is a *compile* error naming the limit
+  there rather than a device that quietly stops recognising anything.)
 - **`g_flip_180`** — the sensor is mounted upside down on the board; the
   flip aligns all streams with the data-collection (training) orientation.
   Set `false` only if your mount differs.
@@ -84,6 +90,57 @@ Camera → (resize to 96×96, WB passthrough) → center 60 % crop [20,77) → b
 
 Any change to `image_provider.cpp` must be mirrored in `AItraining/image_preprocess.py` (see repo-root `CLAUDE.md` for the canonical 6-step pipeline).
 
+## This folder is the legacy 96×96 sign sketch
+
+The OCR (28×28 glyph) pipeline used to live here too, behind
+`#if TM_OCR_GLYPH_MODEL`.  It now has its own self-contained sketch in
+**`TFLite_OCR/`** — same Arduino layout, same shared files, its own exported
+model.  Nothing about the legacy path changed: the pipeline above is the whole
+of this sketch, unconditionally.
+
+If you flash the wrong one you get a clear failure instead of a silently
+mismatched preprocessor.  Each `.ino` checks the export it was handed:
+
+```cpp
+// TFLite.ino — an OCR export sets TM_OCR_GLYPH_MODEL to 1
+#if TM_OCR_GLYPH_MODEL
+#error "TFLite is the legacy 96x96 sketch, but this model_settings.h is an OCR export ..."
+#endif
+```
+
+A legacy export stamps `TM_OCR_GLYPH_MODEL 0`, and an export that predates the
+macro defines nothing at all — both build the 96×96 pipeline they were trained
+for, so old deployed models are untouched.  `TFLite_OCR/tools/ino_build_check.py`
+proves the trap fires by building the crossed pair and requiring both to FAIL,
+because "the file contains an #error" is not the same claim as "the #error
+fires".
+
+**`ocr_glyph.c` / `ocr_glyph.h` are gone from this folder** — not dead weight
+here any more, just not here at all.  Similarly, the OCR tuning constants, the
+glyph scratch allocator, the OCR feed function and the OCR boot banner are no
+longer compiled and discarded in a legacy build; they are absent from the
+source.
+
+### The OCR docs moved
+
+`TFLite_OCR/README.md` is the OCR document: the model contract, the 510-case
+cross-language corpus, the 16/16 mutation run, the N+1 (`_background` → flags
+`0xF0`) contract, and the device wiring check.  `TFLite_OCR/tools/` holds the
+checks that used to point here.
+
+### Partition size — check yours before flashing
+
+The legacy model is much larger than the OCR one, and this is the sketch that
+feels it.  Measured on a full `esp32p4` build: **3,576,201 B of app** (the OCR
+sketch measures 1,179,902 B).  `PartitionScheme=huge_app` gives 3 MB and is
+**not enough** — the build links cleanly and then fails with `text section
+exceeds available space in board`.  You need an APP slot of at least ~3.6 MB:
+a 32 MB scheme (`app5M_fat24M_32MB`, `app13M_data7M_32MB`) or a `custom`
+partition table.  No stock 16 MB scheme is large enough (the biggest is 3 MB).
+`TFLite_OCR/tools/ino_build_check.py` defaults to the 13 MB slot so its link
+check measures the code rather than your flash size, and prints the real figure
+so you can size the partition you actually ship.
+
 ## OOD (No Sign) Signalling
 
 Softmax always normalises its logits to sum to 1.0, which means it outputs a misleadingly "confident" class even on completely unrelated inputs (empty desk, hand in front of lens, fully black frame). The firmware runs a **3-layer cascade** after inference and marks the frame "No Sign" in the shared `flags` field:
@@ -116,6 +173,15 @@ high nibble == 0xF   →  OUT of distribution (No Sign)
 |---|---|---|
 | `0x02` | **Real sign** (in-distribution) | Use them verbatim. `label_id` indexes `kCategoryLabels`. |
 | `0xF2` | **No Sign** (OOD suppressed) | Ignore both. They still hold the softmax hallucination for debug/analysis, but the classifier has rejected this frame. |
+
+The high nibble is set by **either** rejector, and nothing downstream needs to
+know which one fired: the OOD cascade above, or a prediction of the model's own
+`_background` class (matched by label *name*, never by index, so
+the class can sit anywhere in `kCategoryLabels`).  A `_background` frame is a
+real, confident prediction, so it keeps its softmax values in `label_id` /
+`confidence` for the debug log, exactly like an OOD-suppressed frame.  On the
+device's own debug line it prints `BACKGROUND(No Sign)`; the SD CSV carries the
+same flag byte as any other No-Sign frame.
 
 **C helper for the S3 receiver side:**
 
@@ -456,7 +522,7 @@ Each new session auto-creates a numbered run directory:
 └── labels.csv
 ```
 
-- **frame_XXXXX.pgm** — 96×96 8-bit grayscale PGM (`P5`) of the exact pixels fed into the TFLite int8 input tensor.
+- **frame_XXXXX.pgm** — 8-bit grayscale PGM (`P5`) of the exact pixels fed into the TFLite int8 input tensor: 96×96 here, **28×28** in the `TFLite_OCR/` sketch.  Both the header and the payload are sized from the model's real input tensor (`input->bytes` and its dims) at boot, so the file always matches the model and can never be a truncated or over-read buffer.
 - **labels.csv** — one row per written frame, created on first write with a header. Columns:
 
 | Column | Type | Semantics |
@@ -472,7 +538,7 @@ Use `FFatReader` `bundle_runs` or `SDReader` + a plain card reader to pull the r
 
 | Task | Core | Priority | Stack | Role |
 |---|---|---|---|---|
-| `tflm` | 1 | 3 | 32 KB | Capture → pipeline → 3-layer OOD gating → queue UART and SD packets |
+| `tflm` | 1 | 3 | 32 KB | Capture → `GetImage()` pipeline → 3-layer OOD gating + `_background` → queue UART and SD packets |
 | `dbgser` | 0 | 1 | 6 KB | **Debug Serial command parser**: runtime Dark/Lum + OOD tuning + mode switch (INFERENCE ↔ CAPTURE) via sync-framed commands |
 | `uart_tx` | 0 | 2 | 4 KB | Send UART inference packets; drops silently when `s_transmit_enabled == false` |
 | `uart_rx` | 0 | 2 | 4 KB | Read S3 control packets (`ACK_STOP` / `RESUME`); toggle `s_transmit_enabled` |
@@ -485,10 +551,27 @@ Use `FFatReader` `bundle_runs` or `SDReader` + a plain card reader to pull the r
 | `CAMERA_TYPE` | IMX219 | `CAMERA_TYPE_IMX219` / `_OV5647` / `_AUTO` (I2C probe) |
 | `PREPROCESS_MODE` | BG | `PREPROCESS_MODE_BG` / `_GRAY` / `_RGB` |
 | `BG_ENABLE_FOCUS_SEARCH` | 1 | `1` = auto shadow-search box crop (host `crop_mode="auto_search"`); `0` = legacy center 60 % crop (`crop_mode="center"`). Retrain after switching. |
+| `TM_OCR_GLYPH_MODEL` | — (a *guard*, not a knob) | Emitted into `model_settings.h` by the export. This sketch `#error`s if it is `1`, i.e. if an OCR export is dropped in here. There is no mode left to select — see **This folder is the legacy 96×96 sign sketch** above. |
 | `kDebugBaud` | 921600 | Debug serial baud |
 | `kUartBaud` | 921600 | P4↔S3 UART baud |
 | `kEnableSdLogger` | true | Save frames + labels sidecar to SD/FFat |
 | `kSaveEveryNFrames` | 10 | Write every N-th frame (lower = more storage / higher SD bus load) |
+
+### Model operators (`model_resolver.h`)
+
+`model_resolver.h` is generated by the AItraining export from the model's own
+builtin-operator table; `RegisterModelOps()` registers exactly those ops into a
+`MicroMutableOpResolver<N>`.  `TFLite.ino` has a hand-written fallback for
+builds with no generated header.
+
+A **missing** op does not fail the build and is not named at runtime: the model
+flashes fine, `AllocateTensors()` returns `kTfLiteError`, and the sketch prints
+only `AllocateTensors() failed`.  The current exports end with an L2
+normalisation tail (`x / sqrt(sum(x²))`), so **`ReduceMax` and `Rsqrt` must both
+be registered** — they were missing from the generated header *and* from the
+fallback (fixed 2026-10-12; the fallback is now
+`MicroMutableOpResolver<12>`).  If a new export dies at `AllocateTensors()`,
+compare the export's `.tflite` operator list against this file first.
 
 ### OOD / preprocessing overrides (pass via -D compiler flags, not edit)
 
