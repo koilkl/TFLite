@@ -31,8 +31,8 @@ extern const char* kCategoryLabels[kCategoryCount];
 // image_provider.h's values are only fallbacks for older exports.
 constexpr float kOodSignMinPct = 0.300000f;
 constexpr float kOodSignMaxPct = 70.000000f;
-constexpr float kOodMaxProbMin = 0.600000f;
-constexpr float kOodEntropyRatioMax = 0.700000f;
+constexpr float kOodMaxProbMin = 0.400000f;
+constexpr float kOodEntropyRatioMax = 0.850000f;
 
 constexpr int kBgDarkThresh = 0;
 constexpr int kBgLumThresh = 100;

@@ -118,9 +118,10 @@
 // Inference-time OOD tuning.  If any rule fires, the sketch reports the
 // "No Sign" synthetic class (label_id == kCategoryCount, confidence = 0)
 // instead of trusting a softmax hallucination.  Defaults match the host
-// live-predict gates (record_controller _preview_predict): sign_pct in
-// [0.3, 70] %, max_prob >= 0.60, entropy_ratio <= 0.70.  Disable any of
-// these gates by setting to zero.
+// Input Settings / live-predict gates (record_controller _preview_predict):
+// sign_pct in [0.3, 70] %, max_prob >= 0.40, entropy_ratio <= 0.85.  The
+// sketches apply the exported model_settings.h values at boot, so these are
+// only fallbacks for older exports.  Disable any gate by setting it to zero.
 //   SIGN_PCT_MIN / SIGN_PCT_MAX: reject frames where the G-channel mask
 //       outside [min,max] % (e.g. empty road <0.3 %, full shadow >70 %).
 //   MAX_PROB_MIN:       reject softmax top-1 below this fraction.
@@ -133,10 +134,10 @@
 #define OOD_SIGN_PCT_MAX       70.0f
 #endif
 #ifndef OOD_MAX_PROB_MIN
-#define OOD_MAX_PROB_MIN       0.60f
+#define OOD_MAX_PROB_MIN       0.40f
 #endif
 #ifndef OOD_ENTROPY_RATIO_MAX
-#define OOD_ENTROPY_RATIO_MAX  0.70f
+#define OOD_ENTROPY_RATIO_MAX  0.85f
 #endif
 #ifndef OOD_ENABLE            // master switch
 #define OOD_ENABLE            1
