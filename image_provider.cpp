@@ -270,41 +270,46 @@ const char* CameraGetName() {
 }
 
 // Resize library RGB (width src_w) to OUT_WIDTH×OUT_WIDTH×3 with WB gains,
-// nearest-neighbour.  Used by GetImage and the RGB data-collection mode so
-// both cameras always produce the same IMG_SIZE×IMG_SIZE format.
+// exact integer box average (FrameResizeBoxAverageRgb).  Used by GetImage
+// and the resized capture helper so a 160×160 camera frame becomes the
+// 96×96 model input with the SAME resampling AItraining's live preview uses.
 static void resize_rgb_wb(const uint8_t *src, int src_w, uint8_t *dst,
                           uint16_t wb_red, uint16_t wb_blue) {
-  for (int y = 0; y < OUT_HEIGHT; y++) {
-    int src_y = (int)((int64_t)y * src_w / OUT_WIDTH);
-    for (int x = 0; x < OUT_WIDTH; x++) {
-      int src_x = (int)((int64_t)x * src_w / OUT_WIDTH);
-      int si = (src_y * src_w + src_x) * 3;
-      int di = (y * OUT_WIDTH + x) * 3;
-      int r = (int)src[si + 0] * wb_red / 100;  if (r > 255) r = 255;
-      int g = (int)src[si + 1];
-      int b = (int)src[si + 2] * wb_blue / 100; if (b > 255) b = 255;
-      dst[di + 0] = (uint8_t)r;
-      dst[di + 1] = (uint8_t)g;
-      dst[di + 2] = (uint8_t)b;
-    }
-  }
+  FrameResizeBoxAverageRgb(src, src_w, dst, OUT_WIDTH, wb_red, wb_blue);
 }
 
 void CameraSendRgbToSerialWb(uint16_t wb_red, uint16_t wb_blue) {
-  static uint8_t buf[OUT_WIDTH * OUT_HEIGHT * 3];
-  resize_rgb_wb(CameraGetRgb(), CameraGetRgbWidth(), buf, wb_red, wb_blue);
-  // Data-collection sync header: 0xAA 0x55 0xAA + IMG_SIZE×IMG_SIZE×3
+  // Data collection streams the CAMERA CAPTURE resolution — the host's
+  // SerialFrameReader is configured with that same side (e.g. 160), and
+  // resampling here would silently save a different image than the one the
+  // model sees.  WB is applied per pixel on the way out, one row at a time
+  // (a full 384×384×3 frame would be a 432 KB buffer).
+  const uint8_t *src = CameraGetRgb();
+  const int side = CameraGetRgbWidth();
+  if (src == nullptr || side <= 0 || side > 512) return;
+  static uint8_t row[512 * 3];
+  const size_t row_bytes = (size_t)side * 3;
   const uint8_t sync[3] = {0xAA, 0x55, 0xAA};
   Serial.write(sync, 3);
-  Serial.write(buf, sizeof(buf));
+  for (int y = 0; y < side; y++) {
+    const uint8_t *s = src + (size_t)y * row_bytes;
+    for (int x = 0; x < side; x++) {
+      int r = (int)s[x * 3 + 0] * wb_red / 100;  if (r > 255) r = 255;
+      int b = (int)s[x * 3 + 2] * wb_blue / 100; if (b > 255) b = 255;
+      row[x * 3 + 0] = (uint8_t)r;
+      row[x * 3 + 1] = s[x * 3 + 1];
+      row[x * 3 + 2] = (uint8_t)b;
+    }
+    Serial.write(row, row_bytes);
+  }
 }
 
-// Latest frame resized to IMG_SIZE×IMG_SIZE×3 (nearest-neighbour, WB
+// Latest frame resized to IMG_SIZE×IMG_SIZE×3 (exact box average, WB
 // passthrough 100/100).  Capture modes MUST use this instead of
 // CameraGetRgb() directly: the OV5647 library buffer is 160×160×3 and
 // streaming its first IMG_SIZE×IMG_SIZE×3 bytes (row-major) tears the
-// frame — the host would reshape garbage into 96×96.  IMX219 (library
-// output already 96×96) is an identity resize.
+// frame — the host would reshape garbage into 96×96.  With the exported
+// capture side (160) the box average is what makes it 96×96.
 const uint8_t* CameraGetRgbImgSized() {
   static uint8_t buf[OUT_WIDTH * OUT_HEIGHT * 3];
   resize_rgb_wb(CameraGetRgb(), CameraGetRgbWidth(), buf, 100, 100);
@@ -1655,10 +1660,11 @@ TfLiteStatus GetImage(tflite::ErrorReporter* error_reporter, int image_width, in
   }
 
   const uint8_t *rgb_lib = CameraGetRgb();  // raw sensor, no WB
-  const int src_side = CameraGetRgbWidth();  // ORIGINAL capture side (96 or 160...)
-  // OV5647 lib outputs at its own IMG_SIZE (160×160); everything below
-  // expects IMG_SIZE×IMG_SIZE×3.  Nearest-neighbour resize (identity for
-  // IMX219).
+  const int src_side = CameraGetRgbWidth();  // CAPTURE side: kCaptureFrameSide
+  // The camera streams at the exported capture side (e.g. 160×160); the
+  // model consumes IMG_SIZE×IMG_SIZE×3.  Exact integer box average, the
+  // same arithmetic AItraining's live serial preview uses.  Identity when
+  // the capture side already equals IMG_SIZE.
   //
   // WB gains 100/100 = passthrough.  CRITICAL for train/device parity:
   // AItraining captures the IMX219_Grayscale_Serial stream, whose pixels

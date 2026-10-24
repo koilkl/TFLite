@@ -14,15 +14,18 @@ limitations under the License.
 ==============================================================================*/
 
 // ═══════════════════════════════════════════════════════════════════════
-// USER CONFIG — edit these two values only (edit HERE, in this file)
+// RESOLUTION LAYERS — stamped into model_settings.h by Export Model
 //
-//   g_frame_side
-//     Capture / serial-stream resolution (8-512).  The camera libraries
-//     follow it at runtime (unified API, applied in setup()).  Same
-//     variable name as the camera-library example sketches.  The MODEL
-//     INPUT stays at the exported model size (image_provider.h IMG_SIZE);
-//     to change the model input size, re-export the model from AItraining
-//     at that img_size and update image_provider.h to match.
+//   TM_CAPTURE_FRAME_SIDE      camera / serial-stream side    (e.g. 160)
+//   TM_PREPROCESS_FRAME_SIDE   model-input crop/resize side   (e.g. 96)
+//   TM_MODEL_INPUT_SIDE        model tensor side              (img_size)
+//
+// They are deliberately independent.  The camera captures at 160×160;
+// GetImage() box-averages that down to IMG_SIZE before the search/crop
+// pipeline, so the model consumes the resolution it was trained on.  To
+// change the model input size, re-export the model from AItraining at that
+// img_size (the export also stamps the new sides) and update
+// image_provider.h IMG_SIZE to match — the static_assert below enforces it.
 //
 //   g_flip_180
 //     The camera is mounted upside down on the board; the library rotates
@@ -32,18 +35,40 @@ limitations under the License.
 //   (constexpr here, unlike the examples, because this sketch sizes
 //    compile-time arrays from g_frame_side.)
 // ═══════════════════════════════════════════════════════════════════════
-constexpr int  g_frame_side = 96;
-constexpr bool g_flip_180   = true;
-
 // #include <TensorFlowLite.h>
 
 #include "main_functions.h"
-#include "image_provider.h"
-#include "model_settings.h"
+#include "model_settings.h"   // before USER CONFIG: it carries the resolution sides
+#include "image_provider.h"   // includes frame_resize.h (box-average helper)
 // Include the exported model data header.
 // Rename this include to match your exported model's header file name,
 // e.g. "Square_model_data.h" or "MyModel_model_data.h".
 #include "tm_model_data.h"
+
+// Older exports predate the resolution macros: their capture and model
+// input were both IMG_SIZE, which is exactly the fallback.
+#ifndef TM_CAPTURE_FRAME_SIDE
+#define TM_CAPTURE_FRAME_SIDE IMG_SIZE
+#endif
+#ifndef TM_PREPROCESS_FRAME_SIDE
+#define TM_PREPROCESS_FRAME_SIDE IMG_SIZE
+#endif
+
+constexpr int  g_frame_side      = TM_CAPTURE_FRAME_SIDE;
+constexpr int  g_preprocess_side = TM_PREPROCESS_FRAME_SIDE;
+constexpr bool g_flip_180        = true;
+
+// image_provider.cpp is compiled with IMG_SIZE (image_provider.h), so the
+// exported model input MUST agree with it.  A mismatch here would write
+// kNumCols² bytes into an IMG_SIZE² tensor (or vice versa) at runtime.
+static_assert(kNumCols == IMG_SIZE && kNumRows == IMG_SIZE,
+              "model_settings.h kNumCols/kNumRows do not match image_provider.h "
+              "IMG_SIZE — set IMG_SIZE to the exported img_size before building");
+static_assert(g_preprocess_side == IMG_SIZE,
+              "kPreprocessFrameSide must equal IMG_SIZE for the legacy image "
+              "pipeline (the export stamps img_size into both)");
+static_assert(g_frame_side >= 8 && g_frame_side <= 512,
+              "g_frame_side (kCaptureFrameSide) must be 8..512");
 
 
 #include "tensorflow/lite/micro/micro_log.h"
@@ -1696,11 +1721,15 @@ void setup() {
   delay(100);
   Serial.println("P4 TFLite start");
 
-  // USER CONFIG (top of this file): push g_frame_side + g_flip_180 into
+  // USER CONFIG (top of this file): push the CAPTURE side + g_flip_180 into
   // the camera library before any capture/inference code runs.
   ImageProviderConfigureCamera(g_frame_side, g_flip_180);
-  Serial.printf("Camera config: frame_side=%d flip_180=%d\r\n",
-                (int)g_frame_side, (int)g_flip_180);
+  Serial.printf("Camera config: capture=%d model=%d flip_180=%d\r\n",
+                (int)g_frame_side, (int)IMG_SIZE, (int)g_flip_180);
+  if (g_frame_side != IMG_SIZE) {
+    Serial.printf("Resolution: camera %dx%d -> box-average %dx%d -> model input\r\n",
+                  (int)g_frame_side, (int)g_frame_side, IMG_SIZE, IMG_SIZE);
+  }
 #if PREPROCESS_MODE == PREPROCESS_MODE_BG
   Serial.printf("Preprocess: B-G  | Camera: %s\n", CameraGetName());
 #elif PREPROCESS_MODE == PREPROCESS_MODE_GRAY

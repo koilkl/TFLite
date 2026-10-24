@@ -6,32 +6,32 @@ Out-of-distribution (OOD) rejection is built in: empty scenes / overexposed fram
 
 A separate sketch, **`TFLite_OCR/`**, replaces this pipeline with an integer-exact OCR **glyph** front-end for character recognition projects. The UART wire format and the `flags` contract are identical in both — see **This folder is the legacy 96×96 sign sketch** below.
 
-## User Config (the two knobs you edit)
+## User Config (resolution comes from the export)
 
-Edit the **top of `TFLite.ino`** — the `USER CONFIG` block:
+`g_frame_side` and `g_flip_180` live just below the includes in `TFLite.ino`:
 
 ```cpp
-constexpr int  g_frame_side = 96;    // capture / serial-stream resolution (8-512)
-constexpr bool g_flip_180   = true;  // camera is mounted upside down → rotate 180°
+constexpr int  g_frame_side      = TM_CAPTURE_FRAME_SIDE;  // e.g. 160
+constexpr int  g_preprocess_side = TM_PREPROCESS_FRAME_SIDE; // == IMG_SIZE
+constexpr bool g_flip_180        = true;  // camera is mounted upside down
 ```
 
-- **`g_frame_side`** — capture and serial-stream resolution.  Same variable
-  name as the camera-library example sketches.  The camera libraries follow
-  it at runtime (`ImageProviderConfigureCamera()` in `setup()`, unified API
-  shared by both camera libraries).  Set the same value in AItraining
-  **device settings → Image Size** and reflash.  This sketch's sign path has
-  no size ceiling of its own.  (The OCR sketch has one: `TFLite_OCR/` refuses
-  frames outside `side ≤ OCR_MAX_W` and `side² ≤ OCR_MAX_PIXELS` via a
-  `static_assert`, so a too-large value is a *compile* error naming the limit
-  there rather than a device that quietly stops recognising anything.)
+- **`g_frame_side`** — capture and serial-stream resolution, stamped by
+  `Export Model` as `kCaptureFrameSide` (from AItraining
+  **device settings → Image Size**, e.g. 160).  The camera libraries follow
+  it at runtime (`ImageProviderConfigureCamera()` in `setup()`).  It is
+  **deliberately independent of the model input**: `GetImage()` box-averages
+  the 160×160 capture down to `IMG_SIZE` (96) with
+  `FrameResizeBoxAverageRgb()`, the same exact integer average the host
+  preview uses.  A legacy export without the macro falls back to 96.
 - **`g_flip_180`** — the sensor is mounted upside down on the board; the
   flip aligns all streams with the data-collection (training) orientation.
   Set `false` only if your mount differs.
 - The **model input size** is separate: `IMG_SIZE` in `image_provider.h`
   (must match the exported model — AItraining `img_size`).  To change it,
   re-export the model at that size, update the header, and reflash.  A
-  FATAL check at startup refuses to run when the model's input size ≠
-  `IMG_SIZE` (fail loudly, never corrupt memory).
+  `static_assert` plus a FATAL startup check refuse to run when the model's
+  input size ≠ `IMG_SIZE` (fail loudly, never corrupt memory).
 
 The same variable names (`g_frame_side` / `g_flip_180`) appear in both
 camera-library example sketches, so the pattern is consistent across the
@@ -63,7 +63,7 @@ Edit `image_provider.h`:
 |---|---|---|
 | `PREPROCESS_MODE_BG` (default) | Auto search-box crop (or legacy center 60 %) → bilinear → BT.601 luminance of raw (no-WB) RGB → contrast stretch | Sign inference — bit-matches the AItraining training cache |
 | `PREPROCESS_MODE_GRAY` | Same crop + luminance + stretch, no colour logic at all | Identical pixels to BG in the default config |
-| `PREPROCESS_MODE_RGB` | No inference — streams WB-corrected IMG_SIZE×IMG_SIZE×3 RGB to Serial (`0xAA 0x55 0xAA` + payload) | Data collection for AItraining purple-sign projects, like the `IMX219_RGB_Serial` example |
+| `PREPROCESS_MODE_RGB` | No inference — streams WB-corrected `CAPTURE_SIDE²×3` RGB to Serial (`0xAA 0x55 0xAA` + payload).  The native capture side is kept (160 stays 160); the host `SerialFrameReader` must be set to the same Image Size | Data collection for AItraining purple-sign projects, like the `IMX219_RGB_Serial` example |
 
 ### Crop selection (model-input window)
 
@@ -84,7 +84,7 @@ If the crop geometry or pixel transform diverges from the AItraining host, train
 
 ## Pipeline
 
-Camera → (resize to 96×96, WB passthrough) → center 60 % crop [20,77) → bilinear 96×96 of the RGB crop (float32, PIL-style center mapping) → BT.601 luminance (30/59/11, round half up) → contrast stretch (span ≥ 24) → int8 gray−128 → TFLite int8 inference → (OOD 3-layer gating) → UART to S3 / SD log.
+Camera → (exact integer box-average from CAPTURE_SIDE to `IMG_SIZE`, e.g. 160→96, WB passthrough) → center 60 % crop [20,77) → bilinear 96×96 of the RGB crop (float32, PIL-style center mapping) → BT.601 luminance (30/59/11, round half up) → contrast stretch (span ≥ 24) → int8 gray−128 → TFLite int8 inference → (OOD 3-layer gating) → UART to S3 / SD log.
 
 `AItraining/image_preprocess.py` mirrors `crop_resize_bilinear()` bit-for-bit (same float32 arithmetic and op order), so host and device produce IDENTICAL int8 inputs from the same frame — verified with a C transliteration of the firmware on random inputs.
 

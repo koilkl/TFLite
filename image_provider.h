@@ -10,6 +10,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// Exact capture -> preprocessing box-average resize shared with AItraining
+// (record_controller._resize_square_box_average_u8).  Sketches call
+// FrameResizeBoxAverageGray() to scale g_frame_side down to
+// kPreprocessFrameSide before the glyph front-ends run.
+#include "frame_resize.h"
+
 #include <tensorflow/lite/c/common.h>
 #if __has_include("tensorflow/lite/micro/micro_error_reporter.h")
 #include <tensorflow/lite/micro/micro_error_reporter.h>
@@ -141,9 +147,11 @@
 
 // ── IMG_SIZE: MODEL INPUT resolution (not the capture side) ───────────
 // Must match the exported model (AItraining img_size).  The CAPTURE /
-// serial-stream resolution is FRAME_SIDE, configured at the top of
-// TFLite.ino and pushed to the camera library at runtime via
-// ImageProviderConfigureCamera() (unified camera API).
+// serial-stream resolution is g_frame_side (kCaptureFrameSide in the
+// exported model_settings.h), pushed to the camera library at runtime via
+// ImageProviderConfigureCamera() (unified camera API).  GetImage() and
+// CameraGetRgbImgSized() box-average whatever the camera produces down to
+// IMG_SIZE, so capture 160 -> model 96 is automatic.
 #ifndef IMG_SIZE
 #define IMG_SIZE 96
 #endif
@@ -181,13 +189,21 @@ int CameraGetRgbWidth();
 const char* CameraGetName();
 
 // Send WB-corrected RGB to Serial with the data-collection sync header
-// (0xAA 0x55 0xAA + IMG_SIZE×IMG_SIZE×3).  Call after CameraUpdate().
+// (0xAA 0x55 0xAA + CAPTURE_SIDE×CAPTURE_SIDE×3).  The frame is streamed at
+// the CAMERA CAPTURE side (CameraGetRgbWidth(), e.g. 160), because the host
+// configures its SerialFrameReader with that same side — no resampling.  Call
+// after CameraUpdate().
 void CameraSendRgbToSerialWb(uint16_t wb_red, uint16_t wb_blue);
 
-// Latest frame resized to IMG_SIZE×IMG_SIZE×3 (nearest-neighbour, WB
+// Latest frame resized to IMG_SIZE×IMG_SIZE×3 (exact box average, WB
 // passthrough).  Use in capture modes — the library buffer is 160×160 for
 // OV5647 and streaming its first bytes row-major tears the frame.
 const uint8_t* CameraGetRgbImgSized();
+
+// Latest library gray frame (BT.601, native CAPTURE side — not resized).
+// This is the same buffer the IMX219_Grayscale_Serial training stream uses;
+// inference paths that need kPreprocessFrameSide must box-average it with
+// FrameResizeBoxAverageGray() first.
 const uint8_t* CameraGetGrayImgSized();
 
 // Apply the TFLite.ino USER CONFIG (FRAME_SIDE / CAMERA_FLIP_180) to the
