@@ -25,4 +25,16 @@ constexpr int kCaptureFrameSide = TM_CAPTURE_FRAME_SIDE;
 constexpr int kCategoryCount = 3;
 extern const char* kCategoryLabels[kCategoryCount];
 
+// ── Runtime tuning exported from the Preview panel ───────────────
+// setup() applies these to the camera/OOD layer with
+// ImageProviderSetOodThresholds() / ImageProviderSetMaskThresholds();
+// image_provider.h's values are only fallbacks for older exports.
+constexpr float kOodSignMinPct = 0.300000f;
+constexpr float kOodSignMaxPct = 70.000000f;
+constexpr float kOodMaxProbMin = 0.600000f;
+constexpr float kOodEntropyRatioMax = 0.700000f;
+
+constexpr int kBgDarkThresh = 0;
+constexpr int kBgLumThresh = 100;
+
 #endif  // TFLITE_MODEL_SETTINGS_H_
