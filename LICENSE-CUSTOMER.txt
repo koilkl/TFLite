@@ -1,0 +1,47 @@
+LICENSE TERMS FOR PURCHASERS (CUSTOMER SOURCE LICENSE)
+======================================================
+
+This sketch source code (TFLite legacy sign sketch) is provided to you as a resource
+that accompanies the product you purchased. It is LICENSED, NOT SOLD.
+
+Licensor: AIoScout
+Contact:  https://aioscout.io
+Version:  1.0 (2026-10-28)
+
+1. GRANT
+   You may compile this source and flash the resulting firmware onto
+   devices YOU OWN OR CONTROL, and may modify it for your own use on
+   those devices.
+
+2. RESTRICTIONS
+   Unless AIoScout has given prior written consent, you must NOT:
+   (a) redistribute, resell, sublicense or publish this source code or
+       firmware built from it, in whole or in part;
+   (b) remove or obscure any copyright or attribution notices;
+   (c) use any part of it in a competing product or service.
+
+3. OWNERSHIP
+   All intellectual property rights in this source remain with AIoScout
+   (except for the third-party components listed below, which remain
+   with their respective owners).
+
+4. NO WARRANTY / LIABILITY
+   The source and firmware are provided "AS IS", without warranty of
+   any kind. AIoScout shall not be liable for any damages arising from
+   their use. Recognition results are advisory and not safety-rated.
+
+5. THIRD-PARTY COMPONENTS
+   This sketch includes TensorFlow Lite Micro ("TFLite Micro"),
+   Copyright 2017 The TensorFlow Authors, licensed under the Apache
+   License, Version 2.0. The full license text is reproduced in the
+   accompanying LICENSE file (Apache-2.0); it MUST accompany any
+   distribution of this source or firmware built from it.
+
+   This sketch is designed to compile against the Espressif
+   arduino-esp32 core (LGPL-2.1) and ESP-IDF (Apache-2.0); those
+   components are distributed by Espressif Systems under their own
+   licenses and are not part of this distribution.
+
+6. GOVERNING LAW
+   These terms are governed by the laws of the People's Republic of
+   China.
